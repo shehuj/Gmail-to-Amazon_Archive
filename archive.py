@@ -1,0 +1,557 @@
+#!/usr/bin/env python3
+"""Archive Gmail messages to Amazon S3, verify them, and (optionally) trash them.
+
+Modes (run in this order):
+  archive  Read-only Gmail access. Downloads each message in raw RFC 822 form
+           (headers, body and attachments) and uploads it to S3 as a .eml file.
+  verify   Downloads every archived object from S3 and checks its SHA-256
+           against the local manifest.
+  cleanup  Moves *verified* messages to Gmail Trash. Requires --confirm and a
+           typed confirmation (or --yes). Never empties Trash.
+  login    Authorizes both Gmail scopes in a browser and saves the token files,
+           e.g. to copy into GitHub Actions secrets.
+
+Progress is tracked in a local SQLite database so every mode is resumable.
+"""
+
+import argparse
+import base64
+import hashlib
+import json
+import logging
+import os
+import sqlite3
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+from google.auth.exceptions import RefreshError
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+SCOPE_READONLY = "https://www.googleapis.com/auth/gmail.readonly"
+SCOPE_MODIFY = "https://www.googleapis.com/auth/gmail.modify"
+
+# Separate token files so the read-only token can never be used to trash mail.
+TOKEN_READONLY = "token_readonly.json"
+TOKEN_MODIFY = "token_modify.json"
+
+log = logging.getLogger("archive")
+
+
+# --------------------------------------------------------------------------- #
+# State database
+# --------------------------------------------------------------------------- #
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS messages (
+    id            TEXT PRIMARY KEY,
+    thread_id     TEXT,
+    internal_date INTEGER,
+    s3_key        TEXT,
+    sha256        TEXT,
+    size          INTEGER,
+    archived_at   TEXT,
+    verified_at   TEXT,
+    verify_error  TEXT,
+    trashed_at    TEXT,
+    error         TEXT
+);
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+"""
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def open_db(path):
+    db = sqlite3.connect(path)
+    db.row_factory = sqlite3.Row
+    db.executescript(SCHEMA)
+    return db
+
+
+def meta_get(db, key):
+    row = db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def meta_set(db, key, value):
+    if value is None:
+        db.execute("DELETE FROM meta WHERE key = ?", (key,))
+    else:
+        db.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+    db.commit()
+
+
+# --------------------------------------------------------------------------- #
+# Clients
+# --------------------------------------------------------------------------- #
+
+def gmail_credentials(credentials_file, scope, token_file):
+    creds = None
+    if os.path.exists(token_file):
+        creds = Credentials.from_authorized_user_file(token_file, [scope])
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except RefreshError as e:
+                sys.exit(
+                    f"Gmail token in '{token_file}' could not be refreshed ({e}). Run "
+                    "'python archive.py --mode login' to authorize again."
+                )
+        elif os.environ.get("CI"):
+            sys.exit(
+                f"No valid Gmail token in '{token_file}' and no browser is available in CI. "
+                "Run 'python archive.py --mode login' locally and store the token file "
+                "contents as a GitHub secret."
+            )
+        else:
+            if not os.path.exists(credentials_file):
+                sys.exit(
+                    f"OAuth client file '{credentials_file}' not found. "
+                    "Create a Desktop OAuth client in Google Cloud Console and save it there."
+                )
+            with open(credentials_file) as f:
+                client_type = json.load(f)
+            if "installed" not in client_type:
+                kind = client_type.get("type") or ", ".join(client_type) or "empty"
+                sys.exit(
+                    f"'{credentials_file}' is not a Desktop OAuth client (found: {kind}). "
+                    "In Google Cloud Console use Credentials > Create credentials > "
+                    "OAuth client ID > Desktop app, and save that JSON here. "
+                    "Service account keys cannot access a personal Gmail mailbox."
+                )
+            flow = InstalledAppFlow.from_client_secrets_file(credentials_file, [scope])
+            creds = flow.run_local_server(port=0)
+        with open(token_file, "w") as f:
+            f.write(creds.to_json())
+        os.chmod(token_file, 0o600)
+    return creds
+
+
+class ThreadLocalGmail:
+    """One Gmail service per thread: the underlying httplib2 client is not thread-safe."""
+
+    def __init__(self, creds):
+        self.creds = creds
+        self.local = threading.local()
+
+    def get(self):
+        if not hasattr(self.local, "service"):
+            self.local.service = build("gmail", "v1", credentials=self.creds, cache_discovery=False)
+        return self.local.service
+
+
+def run_parallel(fn, items, workers, deadline=None):
+    """Yield (item, result, error) for fn(item), running up to `workers` at once.
+
+    Submits in bounded chunks so a huge pending list doesn't create every future up front.
+    Stops submitting new chunks once `deadline` (a time.monotonic() value) has passed.
+    """
+    chunk = max(workers * 20, 100)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for start in range(0, len(items), chunk):
+            if deadline and time.monotonic() >= deadline:
+                log.warning("--max-runtime reached; stopping after %d of %d. "
+                            "Run again to continue.", start, len(items))
+                return
+            batch = items[start:start + chunk]
+            futures = [(item, pool.submit(fn, item)) for item in batch]
+            for item, fut in futures:
+                try:
+                    yield item, fut.result(), None
+                except Exception as e:  # reported per message by the caller
+                    yield item, None, e
+
+
+class Progress:
+    def __init__(self, total, label):
+        self.total, self.label, self.start = total, label, time.monotonic()
+
+    def log(self, i, failed):
+        elapsed = time.monotonic() - self.start
+        rate = i / elapsed if elapsed else 0
+        eta = (self.total - i) / rate if rate else 0
+        log.info("%s: %d/%d (failed %d) %.1f msg/s, ETA %dh%02dm",
+                 self.label, i, self.total, failed, rate, eta // 3600, eta % 3600 // 60)
+
+
+def s3_client(args):
+    session = boto3.Session(profile_name=args.profile, region_name=args.region)
+    config = Config(
+        max_pool_connections=max(10, args.workers + 2),
+        retries={"max_attempts": 8, "mode": "adaptive"},
+    )
+    return session.client("s3", config=config)
+
+
+def check_bucket(s3, bucket):
+    try:
+        s3.head_bucket(Bucket=bucket)
+    except ClientError as e:
+        sys.exit(f"Cannot access bucket '{bucket}': {e}")
+
+
+def gmail_call(request, retries=6):
+    """Execute a Gmail API request with exponential backoff on rate limits / 5xx."""
+    for attempt in range(retries):
+        try:
+            return request.execute()
+        except HttpError as e:
+            status = e.resp.status
+            if status in (429, 500, 502, 503, 504) or (
+                status == 403 and b"rateLimitExceeded" in (e.content or b"")
+            ):
+                delay = min(2 ** attempt, 60)
+                log.warning("Gmail API %s, retrying in %ss", status, delay)
+                time.sleep(delay)
+                continue
+            raise
+    return request.execute()
+
+
+# --------------------------------------------------------------------------- #
+# archive
+# --------------------------------------------------------------------------- #
+
+def list_messages(gmail, db, query):
+    """Populate the messages table with every message ID. Resumable via page token."""
+    if meta_get(db, "listing_complete") == query:
+        log.info("Message listing already complete for this query; skipping.")
+        return
+    if meta_get(db, "listing_query") != query:
+        meta_set(db, "listing_query", query)
+        meta_set(db, "listing_page_token", None)
+
+    page_token = meta_get(db, "listing_page_token")
+    total = 0
+    while True:
+        resp = gmail_call(
+            gmail.users().messages().list(
+                userId="me", q=query or None, pageToken=page_token, maxResults=500
+            )
+        )
+        msgs = resp.get("messages", [])
+        db.executemany(
+            "INSERT OR IGNORE INTO messages (id, thread_id) VALUES (?, ?)",
+            [(m["id"], m.get("threadId")) for m in msgs],
+        )
+        db.commit()
+        total += len(msgs)
+        page_token = resp.get("nextPageToken")
+        meta_set(db, "listing_page_token", page_token)
+        log.info("Listed %d message IDs so far", total)
+        if not page_token:
+            break
+    meta_set(db, "listing_complete", query)
+
+
+def s3_key_for(prefix, msg_id, internal_date_ms):
+    dt = datetime.fromtimestamp(internal_date_ms / 1000, tz=timezone.utc)
+    return f"{prefix.rstrip('/')}/{dt:%Y/%m}/{msg_id}.eml"
+
+
+def deadline_for(args):
+    return time.monotonic() + args.max_runtime * 60 if args.max_runtime else None
+
+
+def archive_one(args, s3, gmail, msg_id):
+    """Download one message from Gmail and upload it to S3. Runs in a worker thread."""
+    msg = gmail_call(gmail.get().users().messages().get(userId="me", id=msg_id, format="raw"))
+    raw = base64.urlsafe_b64decode(msg["raw"])
+    digest = hashlib.sha256(raw).hexdigest()
+    internal_date = int(msg.get("internalDate", 0))
+    key = s3_key_for(args.prefix, msg_id, internal_date)
+
+    put = dict(
+        Bucket=args.bucket,
+        Key=key,
+        Body=raw,
+        ContentType="message/rfc822",
+        ChecksumSHA256=base64.b64encode(bytes.fromhex(digest)).decode(),
+        Metadata={
+            "gmail-id": msg_id,
+            "gmail-thread-id": msg.get("threadId", ""),
+            "gmail-internal-date": str(internal_date),
+            "gmail-labels": ",".join(msg.get("labelIds", []))[:1500],
+            "sha256": digest,
+        },
+    )
+    if args.kms_key_id:
+        put.update(ServerSideEncryption="aws:kms", SSEKMSKeyId=args.kms_key_id)
+    else:
+        put.update(ServerSideEncryption="AES256")
+    if args.storage_class:
+        put["StorageClass"] = args.storage_class
+    s3.put_object(**put)
+    return msg.get("threadId"), internal_date, key, digest, len(raw)
+
+
+def cmd_archive(args):
+    db = open_db(args.db)
+    s3 = s3_client(args)
+    check_bucket(s3, args.bucket)
+    creds = gmail_credentials(args.credentials, SCOPE_READONLY, TOKEN_READONLY)
+
+    list_messages(build("gmail", "v1", credentials=creds, cache_discovery=False), db, args.query)
+
+    sql = (
+        "SELECT id FROM messages WHERE (archived_at IS NULL OR verify_error IS NOT NULL) "
+        "AND trashed_at IS NULL ORDER BY id"
+    )
+    if args.limit:
+        sql += f" LIMIT {int(args.limit)}"
+    pending = [r["id"] for r in db.execute(sql)]
+    log.info("%d messages to archive with %d workers", len(pending), args.workers)
+
+    gmail = ThreadLocalGmail(creds)
+    progress = Progress(len(pending), "Archive")
+    done = failed = 0
+    results = run_parallel(lambda m: archive_one(args, s3, gmail, m), pending, args.workers,
+                           deadline_for(args))
+    for i, (msg_id, result, err) in enumerate(results, 1):
+        if err is None:
+            thread_id, internal_date, key, digest, size = result
+            db.execute(
+                "UPDATE messages SET thread_id=?, internal_date=?, s3_key=?, sha256=?, size=?, "
+                "archived_at=?, error=NULL, verified_at=NULL, verify_error=NULL WHERE id=?",
+                (thread_id, internal_date, key, digest, size, now(), msg_id),
+            )
+            done += 1
+        else:
+            if isinstance(err, HttpError) and err.resp.status == 404:
+                # Deleted from Gmail since listing; nothing to archive.
+                msg = "not found in Gmail"
+            else:
+                msg = f"{type(err).__name__}: {err}"[:500]
+            db.execute("UPDATE messages SET error=? WHERE id=?", (msg, msg_id))
+            failed += 1
+            log.error("Failed %s: %s", msg_id, msg)
+        if i % 100 == 0:
+            db.commit()
+            progress.log(i, failed)
+    db.commit()
+
+    log.info("Archive finished: %d archived, %d failed", done, failed)
+    print_summary(db)
+
+
+# --------------------------------------------------------------------------- #
+# verify
+# --------------------------------------------------------------------------- #
+
+def cmd_verify(args):
+    db = open_db(args.db)
+    s3 = s3_client(args)
+    check_bucket(s3, args.bucket)
+
+    sql = "SELECT id, s3_key, sha256, size FROM messages WHERE archived_at IS NOT NULL"
+    if not args.reverify:
+        sql += " AND verified_at IS NULL"
+    rows = db.execute(sql).fetchall()
+    log.info("%d archived messages to verify", len(rows))
+
+    def check(r):
+        obj = s3.get_object(Bucket=args.bucket, Key=r["s3_key"])
+        h = hashlib.sha256()
+        size = 0
+        for chunk in obj["Body"].iter_chunks(1024 * 1024):
+            h.update(chunk)
+            size += len(chunk)
+        if h.hexdigest() != r["sha256"]:
+            return f"sha256 mismatch (expected {r['sha256']}, got {h.hexdigest()})"
+        if size != r["size"]:
+            return f"size mismatch (expected {r['size']}, got {size})"
+        return None
+
+    progress = Progress(len(rows), "Verify")
+    ok = bad = 0
+    for i, (r, mismatch, exc) in enumerate(run_parallel(check, rows, args.workers, deadline_for(args)), 1):
+        err = mismatch or (exc and f"{type(exc).__name__}: {exc}"[:500])
+        if err:
+            bad += 1
+            log.error("Verify FAILED %s: %s", r["id"], err)
+            db.execute(
+                "UPDATE messages SET verified_at=NULL, verify_error=? WHERE id=?",
+                (err, r["id"]),
+            )
+        else:
+            ok += 1
+            db.execute(
+                "UPDATE messages SET verified_at=?, verify_error=NULL WHERE id=?",
+                (now(), r["id"]),
+            )
+        if i % 100 == 0:
+            db.commit()
+            progress.log(i, bad)
+    db.commit()
+
+    log.info("Verify finished: %d OK, %d failed", ok, bad)
+    print_summary(db)
+    if bad:
+        sys.exit(1)
+
+
+# --------------------------------------------------------------------------- #
+# cleanup
+# --------------------------------------------------------------------------- #
+
+def cmd_cleanup(args):
+    db = open_db(args.db)
+
+    unverified = db.execute(
+        "SELECT COUNT(*) FROM messages WHERE archived_at IS NOT NULL AND verified_at IS NULL"
+    ).fetchone()[0]
+    if unverified and not args.allow_partial:
+        sys.exit(
+            f"{unverified} archived messages are not verified. Run --mode verify and resolve "
+            "failures first (or pass --allow-partial to trash only the verified ones)."
+        )
+
+    sql = (
+        "SELECT id FROM messages WHERE verified_at IS NOT NULL AND trashed_at IS NULL "
+        "ORDER BY internal_date"
+    )
+    if args.limit:
+        sql += f" LIMIT {int(args.limit)}"
+    ids = [r["id"] for r in db.execute(sql)]
+    if not ids:
+        log.info("Nothing to clean up.")
+        return
+
+    print(f"{len(ids)} verified messages will be moved to Gmail Trash.")
+    print("Trash is NOT emptied; Gmail deletes Trash items permanently after 30 days.")
+    if args.dry_run:
+        print("Dry run: no changes made.")
+        return
+    if not args.confirm:
+        sys.exit("Refusing to modify Gmail without --confirm.")
+    if not args.yes:
+        typed = input(f"Type TRASH {len(ids)} to proceed: ").strip()
+        if typed != f"TRASH {len(ids)}":
+            sys.exit("Confirmation did not match; aborting.")
+
+    gmail = ThreadLocalGmail(gmail_credentials(args.credentials, SCOPE_MODIFY, TOKEN_MODIFY))
+
+    def trash(msg_id):
+        gmail_call(gmail.get().users().messages().trash(userId="me", id=msg_id))
+
+    progress = Progress(len(ids), "Cleanup")
+    done = failed = 0
+    results = run_parallel(trash, ids, args.workers, deadline_for(args))
+    for i, (msg_id, _, err) in enumerate(results, 1):
+        if err is None:
+            db.execute("UPDATE messages SET trashed_at=? WHERE id=?", (now(), msg_id))
+            done += 1
+        else:
+            failed += 1
+            log.error("Trash failed %s: %s", msg_id, err)
+        if i % 100 == 0:
+            db.commit()
+            progress.log(i, failed)
+    db.commit()
+
+    log.info("Cleanup finished: %d trashed, %d failed", done, failed)
+    print_summary(db)
+
+
+# --------------------------------------------------------------------------- #
+# status
+# --------------------------------------------------------------------------- #
+
+def print_summary(db):
+    q = lambda sql: db.execute(sql).fetchone()[0]  # noqa: E731
+    print(
+        "\nState summary\n"
+        f"  listed:         {q('SELECT COUNT(*) FROM messages')}\n"
+        f"  archived:       {q('SELECT COUNT(*) FROM messages WHERE archived_at IS NOT NULL')}\n"
+        f"  archive errors: {q('SELECT COUNT(*) FROM messages WHERE archived_at IS NULL AND error IS NOT NULL')}\n"
+        f"  verified:       {q('SELECT COUNT(*) FROM messages WHERE verified_at IS NOT NULL')}\n"
+        f"  verify errors:  {q('SELECT COUNT(*) FROM messages WHERE verify_error IS NOT NULL')}\n"
+        f"  trashed:        {q('SELECT COUNT(*) FROM messages WHERE trashed_at IS NOT NULL')}\n"
+        f"  archived bytes: {q('SELECT COALESCE(SUM(size), 0) FROM messages WHERE archived_at IS NOT NULL')}"
+    )
+
+
+def cmd_login(args):
+    for scope, token_file in ((SCOPE_READONLY, TOKEN_READONLY), (SCOPE_MODIFY, TOKEN_MODIFY)):
+        print(f"Authorizing {scope.rsplit('/', 1)[-1]} -> {token_file}")
+        gmail_credentials(args.credentials, scope, token_file)
+    print("Done. For GitHub Actions, store each file's contents as a repository secret.")
+
+
+def cmd_status(args):
+    print_summary(open_db(args.db))
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--mode", required=True, choices=["archive", "verify", "cleanup", "status", "login"])
+    p.add_argument("--bucket", help="S3 bucket name (required for archive/verify)")
+    p.add_argument("--region", default=None, help="AWS region, e.g. us-east-1")
+    p.add_argument("--profile", default=None, help="AWS CLI profile name")
+    p.add_argument("--prefix", default="gmail", help="S3 key prefix (default: gmail)")
+    p.add_argument("--db", default="archive_state.sqlite3", help="Local state database")
+    p.add_argument("--credentials", default="credentials.json", help="Google OAuth client file")
+    p.add_argument("--query", default="",
+                   help="Gmail search query to restrict messages, e.g. 'before:2020/01/01'. "
+                        "Spam and Trash are always excluded.")
+    p.add_argument("--limit", type=int, default=0, help="Process at most N messages this run")
+    p.add_argument("--workers", type=int, default=8,
+                   help="Parallel Gmail/S3 requests for archive/verify/cleanup (default 8). Gmail allows "
+                        "roughly 50 message downloads per second per user.")
+    p.add_argument("--storage-class", default=None,
+                   help="S3 storage class, e.g. STANDARD_IA, GLACIER_IR, DEEP_ARCHIVE")
+    p.add_argument("--kms-key-id", default=None, help="Use SSE-KMS with this key (default SSE-S3)")
+    p.add_argument("--reverify", action="store_true", help="verify: re-check already verified objects")
+    p.add_argument("--confirm", action="store_true", help="cleanup: required to modify Gmail")
+    p.add_argument("--yes", action="store_true",
+                   help="cleanup: skip the typed confirmation (for automation; needs --confirm)")
+    p.add_argument("--max-runtime", type=int, default=0,
+                   help="archive/verify/cleanup: stop cleanly after N minutes (resume later)")
+    p.add_argument("--dry-run", action="store_true", help="cleanup: show what would be trashed")
+    p.add_argument("--allow-partial", action="store_true",
+                   help="cleanup: proceed even if some archived messages are unverified")
+    p.add_argument("-v", "--verbose", action="store_true")
+    args = p.parse_args(argv)
+    if args.mode in ("archive", "verify") and not args.bucket:
+        p.error("--bucket is required for archive and verify modes")
+    if args.yes and not args.confirm:
+        p.error("--yes requires --confirm")
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    {"archive": cmd_archive, "verify": cmd_verify,
+     "cleanup": cmd_cleanup, "status": cmd_status, "login": cmd_login}[args.mode](args)
+
+
+if __name__ == "__main__":
+    main()

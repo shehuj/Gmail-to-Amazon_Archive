@@ -1,0 +1,130 @@
+name: Clean up Gmail mailbox
+
+# Moves archived *and verified* messages to Gmail Trash. Never empties Trash.
+# Defaults to a dry run; a real run needs dry_run unchecked and confirm = TRASH.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: only report how many messages would be trashed"
+        type: boolean
+        default: true
+      confirm:
+        description: "Type TRASH to confirm a real run (ignored for dry runs)"
+        required: false
+        default: ""
+      limit:
+        description: "Max messages to trash this run (0 = all verified messages)"
+        required: false
+        default: "0"
+      workers:
+        description: "Parallel requests"
+        required: false
+        default: "8"
+      max_runtime:
+        description: "Minutes before stopping cleanly (job limit is 6h)"
+        required: false
+        default: "330"
+
+permissions:
+  contents: read
+  id-token: write # OIDC token for assuming the AWS role
+
+# Shared with the ingest workflow so the S3 state database is never written concurrently.
+concurrency:
+  group: gmail-archive-state
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    # Store GMAIL_TOKEN_MODIFY as a secret of this environment, and optionally add
+    # required reviewers to it, so only approved cleanup runs can modify the mailbox.
+    environment: mailbox-cleanup
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      STATE_URI: s3://${{ vars.S3_BUCKET }}/state/archive_state.sqlite3
+    steps:
+      - name: Check confirmation
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$DRY_RUN" != "true" ] && [ "$CONFIRM" != "TRASH" ]; then
+            echo "::error::Real cleanup requires the confirm input to be exactly TRASH."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Download state database
+        id: state
+        run: |
+          if ! aws s3 ls "$STATE_URI" > /dev/null 2>&1; then
+            echo "::error::No state database at $STATE_URI. Run the ingest workflow first."
+            exit 1
+          fi
+          aws s3 cp "$STATE_URI" archive_state.sqlite3
+
+      - name: Dry run
+        if: inputs.dry_run
+        env:
+          LIMIT: ${{ inputs.limit }}
+        run: python archive.py --mode cleanup --dry-run --limit "$LIMIT"
+
+      - name: Write Gmail token
+        if: ${{ !inputs.dry_run }}
+        env:
+          GMAIL_TOKEN: ${{ secrets.GMAIL_TOKEN_MODIFY }}
+        run: |
+          if [ -z "$GMAIL_TOKEN" ]; then
+            echo "::error::Secret GMAIL_TOKEN_MODIFY is not set. Run 'python archive.py --mode login' locally."
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$GMAIL_TOKEN" > token_modify.json
+
+      - name: Move verified messages to Trash
+        id: cleanup
+        if: ${{ !inputs.dry_run }}
+        env:
+          LIMIT: ${{ inputs.limit }}
+          WORKERS: ${{ inputs.workers }}
+          MAX_RUNTIME: ${{ inputs.max_runtime }}
+        run: |
+          python archive.py --mode cleanup --confirm --yes \
+            --limit "$LIMIT" --workers "$WORKERS" --max-runtime "$MAX_RUNTIME"
+
+      - name: Upload state database
+        # Records which messages were trashed, even if the run failed part-way.
+        if: always() && steps.state.outcome == 'success' && !inputs.dry_run
+        run: |
+          python -c "import sqlite3,sys; r=sqlite3.connect('archive_state.sqlite3').execute('PRAGMA integrity_check').fetchone()[0]; sys.exit(r != 'ok')"
+          aws s3 cp archive_state.sqlite3 "$STATE_URI"
+
+      - name: Job summary
+        if: always() && steps.state.outcome == 'success'
+        run: |
+          {
+            echo '### Gmail archive state'
+            echo '```'
+            python archive.py --mode status
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

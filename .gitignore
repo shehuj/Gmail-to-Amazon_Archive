@@ -1,0 +1,20 @@
+# Credentials and OAuth tokens
+credentials.json
+token*.json
+*.pem
+.env
+
+# Local archive state (back this up separately — do not commit)
+archive_state.sqlite3
+*.sqlite3
+*.sqlite3-journal
+*.log
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Editor / OS
+.vscode/
+.DS_Store

@@ -1,0 +1,137 @@
+name: Ingest Gmail to S3
+
+# Archives Gmail messages to S3 (read-only Gmail access), then verifies the upload.
+# State is kept in S3 at s3://<S3_BUCKET>/state/archive_state.sqlite3 between runs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      query:
+        description: "Gmail search query (blank = all mail except Spam/Trash), e.g. older_than:1y"
+        required: false
+        default: ""
+      limit:
+        description: "Max messages to archive this run (0 = no limit)"
+        required: false
+        default: "0"
+      workers:
+        description: "Parallel requests (Gmail allows ~50 downloads/s per user)"
+        required: false
+        default: "8"
+      storage_class:
+        description: "S3 storage class for new uploads"
+        type: choice
+        options: [STANDARD, STANDARD_IA, GLACIER_IR, INTELLIGENT_TIERING]
+        default: STANDARD
+      max_runtime:
+        description: "Minutes to spend on archive + verify before stopping cleanly (job limit is 6h)"
+        required: false
+        default: "300"
+      run_verify:
+        description: "Verify uploaded objects after archiving"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # OIDC token for assuming the AWS role
+
+# Shared with the cleanup workflow so the S3 state database is never written concurrently.
+concurrency:
+  group: gmail-archive-state
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      BUCKET: ${{ vars.S3_BUCKET }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      STATE_URI: s3://${{ vars.S3_BUCKET }}/state/archive_state.sqlite3
+    steps:
+      - name: Record start time
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Write Gmail token
+        env:
+          GMAIL_TOKEN: ${{ secrets.GMAIL_TOKEN_READONLY }}
+        run: |
+          if [ -z "$GMAIL_TOKEN" ]; then
+            echo "::error::Secret GMAIL_TOKEN_READONLY is not set. Run 'python archive.py --mode login' locally."
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$GMAIL_TOKEN" > token_readonly.json
+
+      - name: Download state database
+        id: state
+        run: |
+          if aws s3 ls "$STATE_URI" > /dev/null 2>&1; then
+            aws s3 cp "$STATE_URI" archive_state.sqlite3
+          else
+            echo "::warning::No state database at $STATE_URI; starting fresh."
+          fi
+
+      - name: Archive
+        env:
+          QUERY: ${{ inputs.query }}
+          LIMIT: ${{ inputs.limit }}
+          WORKERS: ${{ inputs.workers }}
+          STORAGE_CLASS: ${{ inputs.storage_class }}
+          MAX_RUNTIME: ${{ inputs.max_runtime }}
+        run: |
+          python archive.py --mode archive \
+            --bucket "$BUCKET" --region "$AWS_REGION" \
+            --query "$QUERY" --limit "$LIMIT" --workers "$WORKERS" \
+            --storage-class "$STORAGE_CLASS" --max-runtime "$MAX_RUNTIME"
+
+      - name: Verify
+        if: inputs.run_verify
+        env:
+          WORKERS: ${{ inputs.workers }}
+          MAX_RUNTIME: ${{ inputs.max_runtime }}
+        run: |
+          remaining=$(( MAX_RUNTIME - ($(date +%s) - JOB_START) / 60 ))
+          if [ "$remaining" -le 5 ]; then
+            echo "::warning::No time left to verify this run; run the workflow again to continue."
+            exit 0
+          fi
+          python archive.py --mode verify \
+            --bucket "$BUCKET" --region "$AWS_REGION" \
+            --workers "$WORKERS" --max-runtime "$remaining"
+
+      - name: Upload state database
+        # Runs even if archive/verify failed, so progress is never lost, but only if the
+        # download step succeeded (otherwise a fresh database would overwrite real state).
+        if: always() && steps.state.outcome == 'success'
+        run: |
+          python -c "import sqlite3,sys; r=sqlite3.connect('archive_state.sqlite3').execute('PRAGMA integrity_check').fetchone()[0]; sys.exit(r != 'ok')"
+          aws s3 cp archive_state.sqlite3 "$STATE_URI"
+
+      - name: Job summary
+        if: always() && steps.state.outcome == 'success'
+        run: |
+          {
+            echo '### Gmail archive state'
+            echo '```'
+            python archive.py --mode status
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,80 +1,412 @@
-# Gmail-to-Amazon_Archive
+# Gmail-to-Amazon Archive
 
-Your implementation package is ready
-
-Gmail → S3 Archive Starter
+Archive Gmail messages to a private Amazon S3 bucket, verify the archive, and then
+(optionally) move the archived messages to Gmail Trash to free up storage.
 
 Python · Gmail API · Boto3 · SQLite · AWS S3
 
-4 files, including a resumable migration script and setup guide
+> **Status:**
+>
+> - **Tested with real Gmail and S3:** a small `archive` run.
+> - **Tested offline only** (fake Gmail and S3): parallel workers, `verify`,
+>   `cleanup`, `--max-runtime`, and the GitHub Actions workflows, which also pass
+>   `actionlint`.
+>
+> Start each new stage with a small `--limit` run.
 
-Download the Gmail-to-S3 starter project⁠￼
+## How it works
 
-The package includes:
+The migration runs in separate, resumable stages:
 
-File
+| Mode | Gmail access | What it does |
+| --- | --- | --- |
+| `archive` | read-only | Downloads each message in raw RFC 822 form (headers, body and attachments) and uploads it to S3 as a `.eml` file. Records its SHA-256 checksum. |
+| `verify` | none | Downloads every archived object from S3 and compares its SHA-256 and size with the local manifest. |
+| `cleanup` | modify | Moves **verified** messages to Gmail Trash. Never empties Trash. |
+| `status` | none | Prints counts of listed, archived, verified and trashed messages. |
+| `login` | both | Authorizes both Gmail scopes in a browser and saves the token files, e.g. for GitHub Actions secrets. |
 
-Purpose
+Objects are stored as:
 
-archive.py
+```text
+s3://YOUR_BUCKET/gmail/YYYY/MM/<gmail-message-id>.eml
+```
 
-Archive, verify and gated cleanup modes
+Each object is encrypted at rest (SSE-S3 by default, or SSE-KMS). It carries metadata
+for the Gmail message ID, thread ID, internal date, labels and SHA-256.
 
-README.md
+Progress is tracked in a local SQLite database (`archive_state.sqlite3`), so you can
+interrupt any stage and re-run it to resume where it stopped.
 
-AWS setup, Google OAuth, commands and recovery steps
+## Files
 
-requirements.txt
+| File | Purpose |
+| --- | --- |
+| `archive.py` | Archive, verify, gated cleanup, status and login modes |
+| `requirements.txt` | Python dependencies |
+| `.github/workflows/ingest.yml` | Manually triggered GitHub Actions workflow: archive + verify |
+| `.github/workflows/cleanup.yml` | Manually triggered GitHub Actions workflow: move verified mail to Trash |
+| `aws/` | IAM trust and permissions policies for the GitHub Actions role |
+| `.gitignore` | Keeps credentials, OAuth tokens and local state out of git |
 
-Python dependencies
+## Setup
 
-.gitignore
+### 1. Python environment
 
-Helps prevent committing credentials and local state
+Requires Python 3.9+.
 
-
-The script has been syntax-checked. It has not been tested against your actual Gmail account or AWS environment.
-
-Follow these steps on your Mac
-
-1. Extract the project
-
-Download and extract the ZIP. Open Terminal in the extracted gmail_s3_archive directory.
-
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
 
-2. Prepare Google and AWS
+### 2. Google OAuth client
 
-* In  ⁠Google Cloud Console, enable the Gmail API and create a Desktop OAuth client. Save its JSON file as credentials.json.
-* Configure AWS CLI credentials using your existing AWS profile or IAM Identity Center.
-* Create a private S3 bucket with public access blocked, encryption and versioning enabled. AWS recommends private access, least-privilege permissions and appropriate encryption for S3 data.   
+1. In [Google Cloud Console](https://console.cloud.google.com/), create or pick a project.
+2. Enable the **Gmail API** (APIs & Services → Library).
+3. Configure the OAuth consent screen (**Google Auth Platform**):
+   - Choose **External**.
+   - Under **Audience → Test users**, add the Gmail address you are archiving.
+4. Create credentials: **OAuth client ID → Desktop app**. Don't use a service
+   account key: service accounts can't access a personal Gmail mailbox.
+5. Download the JSON file and save it in this folder as `credentials.json`. It should
+   have a single top-level key, `installed`.
 
-3. Run the migration in safe stages
+On the first run, a browser window opens so you can authorize access. Google shows
+"Google hasn't verified this app". That's expected for your own app, so click
+**Continue**.
 
-First, archive your messages using read-only Gmail access:
+- `archive` requests the read-only scope `gmail.readonly` and saves the token to `token_readonly.json`.
+- `cleanup` requests `gmail.modify` and saves the token to a separate `token_modify.json`.
+  The read-only token can never be used to trash mail.
+- `python archive.py --mode login` authorizes both scopes up front.
 
-python archive.py --mode archive \
-  --bucket YOUR_BUCKET_NAME \
-  --region us-east-1
+While the app is in **Testing** mode, tokens expire after 7 days. Then you must
+delete `token_*.json` and sign in again. To avoid this, publish the app to
+**In production** (see [GitHub Actions](#github-actions)).
 
-  Next, run the integrity verification:
+### 3. AWS credentials and bucket
 
-python archive.py --mode verify \
-  --bucket YOUR_BUCKET_NAME \
-  --region us-east-1
+Configure AWS CLI credentials, using an existing profile or IAM Identity Center:
 
-The verification downloads the archived objects and compares their SHA-256 checksums against the local manifest. Review all failures before proceeding.
+```bash
+aws configure            # or: aws configure sso
+aws sts get-caller-identity
+```
 
-Only after successful verification should you authorize the separate cleanup phase. That phase moves verified messages to Gmail Trash using the Gmail API’s message-trash operation.  
+Create a private bucket with public access blocked, default encryption and versioning enabled:
 
-Do not empty Trash automatically. First confirm the archived messages and attachments can be retrieved from S3 and that Gmail storage has decreased as expected.
+```bash
+BUCKET=your-gmail-archive-bucket
+REGION=us-east-1
 
-Two things to know before starting
+aws s3api create-bucket --bucket "$BUCKET" --region "$REGION"
+# For regions other than us-east-1, add:
+#   --create-bucket-configuration LocationConstraint="$REGION"
 
-* The default migration excludes messages already in Spam or Trash. It covers the other messages returned by Gmail, including archived mail.
-* Your local archive_state.sqlite3 database is important. Back it up securely and keep it alongside the archive records; it tracks which messages have been archived and verified.
+aws s3api put-public-access-block --bucket "$BUCKET" \
+  --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
 
-My recommendation is to run the first migration from your Mac, then decide whether to automate future archiving. That keeps the initial setup simple and avoids unnecessary Lambda, scheduling and monitoring costs.
+aws s3api put-bucket-versioning --bucket "$BUCKET" \
+  --versioning-configuration Status=Enabled
 
+aws s3api put-bucket-encryption --bucket "$BUCKET" \
+  --server-side-encryption-configuration \
+  '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+```
+
+The IAM identity running the script needs these permissions on the bucket:
+
+- `s3:ListBucket`
+- `s3:PutObject` and `s3:GetObject` on `arn:aws:s3:::YOUR_BUCKET/*`
+- KMS permissions for the key, if you use `--kms-key-id`
+
+## Usage
+
+### Step 1: Archive (read-only)
+
+Start with a small trial run:
+
+```bash
+python archive.py --mode archive --bucket YOUR_BUCKET --region us-east-1 --limit 20
+```
+
+Then try a bigger batch and check the speed and estimated time left in the
+progress lines:
+
+```bash
+python archive.py --mode archive --bucket YOUR_BUCKET --region us-east-1 --limit 2000
+```
+
+Then archive everything. `caffeinate -i` keeps your Mac awake. Raise `--workers`
+for speed, and lower it if you see `Gmail API 429` warnings:
+
+```bash
+caffeinate -i python archive.py --mode archive --bucket YOUR_BUCKET --region us-east-1 --workers 12
+```
+
+The first run lists every message ID, which takes a few minutes for a large
+mailbox. Later runs skip the listing and continue with what is left.
+
+Choose your storage class before the full run. `--storage-class` only applies to
+new uploads.
+
+Archive only part of your mailbox with a Gmail search query:
+
+```bash
+python archive.py --mode archive --bucket YOUR_BUCKET --region us-east-1 \
+  --query "before:2020/01/01"
+```
+
+### Step 2: Verify
+
+```bash
+python archive.py --mode verify --bucket YOUR_BUCKET --region us-east-1
+```
+
+This downloads each archived object and compares its SHA-256 checksum and size with
+the local manifest. The command exits non-zero if any object fails.
+
+- Review every failure before going further.
+- Re-run `archive` to retry messages that failed to upload or failed verification.
+- Use `--reverify` to re-check objects that already passed.
+
+### Step 3: Spot-check the archive
+
+Before you remove anything from Gmail, download a few objects and open them in a
+mail client:
+
+```bash
+aws s3 ls s3://YOUR_BUCKET/gmail/ --recursive | head
+aws s3 cp s3://YOUR_BUCKET/gmail/2019/06/<id>.eml .
+open <id>.eml    # opens in Apple Mail
+```
+
+Pick some messages that have attachments. Check that the attachments open.
+
+### Step 4: Cleanup (moves mail to Gmail Trash)
+
+Only run this after verification passes. First preview what would be trashed:
+
+```bash
+python archive.py --mode cleanup --dry-run
+```
+
+Then run it:
+
+```bash
+python archive.py --mode cleanup --confirm
+```
+
+Cleanup has these safeguards:
+
+- It refuses to run while any archived message is unverified. Use `--allow-partial` to override.
+- It requires `--confirm`, plus typing `TRASH <count>` at the prompt. For automation, `--yes` replaces the prompt.
+- It only trashes messages that are recorded as verified in the local database.
+- It never empties Trash. Gmail permanently deletes Trash items after 30 days.
+
+Before emptying Trash yourself, check two things:
+
+- The archived messages and attachments can be retrieved from S3.
+- Your Gmail storage has decreased as expected.
+
+### Check progress at any time
+
+```bash
+python archive.py --mode status
+```
+
+## Options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--mode` | (required) | `archive`, `verify`, `cleanup`, `status` or `login` |
+| `--bucket` | (none) | S3 bucket. Required for `archive` and `verify`. |
+| `--region` | AWS config | AWS region, e.g. `us-east-1` |
+| `--profile` | AWS default | AWS CLI profile name |
+| `--prefix` | `gmail` | S3 key prefix |
+| `--db` | `archive_state.sqlite3` | Local state database |
+| `--credentials` | `credentials.json` | Google OAuth client file |
+| `--query` | (all mail) | Gmail search query. Spam and Trash are always excluded. |
+| `--limit` | 0 (no limit) | Process at most N messages in this run |
+| `--workers` | 8 | Parallel requests for `archive`, `verify` and `cleanup`. Gmail allows roughly 50 message requests per second per user. |
+| `--storage-class` | `STANDARD` | e.g. `STANDARD_IA`, `GLACIER_IR`, `INTELLIGENT_TIERING`, `DEEP_ARCHIVE` |
+| `--kms-key-id` | (SSE-S3) | Encrypt with SSE-KMS using this key |
+| `--reverify` | off | `verify`: re-check objects that already passed |
+| `--dry-run` | off | `cleanup`: show the count only, change nothing |
+| `--confirm` | off | `cleanup`: required to modify Gmail |
+| `--yes` | off | `cleanup`: skip the typed confirmation, for automation. Requires `--confirm`. |
+| `--max-runtime` | 0 (no limit) | Stop `archive`, `verify` or `cleanup` cleanly after N minutes. Run again to continue. |
+| `--allow-partial` | off | `cleanup`: proceed even if some messages are unverified |
+| `-v`, `--verbose` | off | Debug logging |
+
+Storage class notes:
+
+- `GLACIER_IR` and `STANDARD_IA` are good fits for mail you rarely open.
+- `DEEP_ARCHIVE` is cheapest, but retrieval takes hours. `verify` cannot read those objects until they are restored.
+
+## Important notes
+
+- **Spam and Trash are excluded.** The migration covers every other message Gmail
+  returns, including archived mail (not in the Inbox).
+- **Back up `archive_state.sqlite3`.** It is the manifest of what was archived, the
+  checksums, and what was verified and trashed. Store a copy securely alongside the
+  archive. For example:
+
+  ```bash
+  aws s3 cp archive_state.sqlite3 s3://YOUR_BUCKET/state/archive_state.sqlite3
+  ```
+
+  This is the same location the GitHub Actions workflows use.
+
+- **Never commit secrets.** `credentials.json`, `token_*.json` and the database are
+  excluded by `.gitignore`.
+- **Rate limits.** Gmail API rate-limit and 5xx errors are retried with exponential
+  backoff. If you see many rate-limit warnings, lower `--workers`.
+- **Large mailboxes take hours.** Runs can be stopped and resumed at any time.
+  Progress is saved every 100 messages.
+
+## Recovery
+
+| Situation | What to do |
+| --- | --- |
+| Script interrupted | Re-run the same command. Completed messages are skipped. |
+| Some messages failed to archive | Check `status`, then re-run `archive`. Messages deleted from Gmail after listing are recorded as `not found in Gmail`. |
+| Verification failures | Fix the cause, then re-run `archive`. Messages that failed verification are re-uploaded. Then run `verify` again. |
+| Revoke OAuth access | Delete `token_*.json` and remove the app at <https://myaccount.google.com/permissions>. |
+| Restore a message to Gmail | Within 30 days, move it out of Trash in Gmail. After that, import the `.eml` from S3 using a mail client. |
+| Workflow stopped at `max_runtime` | Run the workflow again. It continues from the state database in S3. |
+| Lost `archive_state.sqlite3` | Objects in S3 still carry the Gmail ID and SHA-256 in their metadata. Do not run `cleanup` without a valid manifest. |
+
+## Troubleshooting
+
+| Error | Cause and fix |
+| --- | --- |
+| `ModuleNotFoundError: No module named 'google'` | The virtual environment isn't active. Run `source .venv/bin/activate`, or run `.venv/bin/python archive.py ...`. |
+| `... is not a Desktop OAuth client (found: service_account)` | `credentials.json` is a service account key. Create an **OAuth client ID → Desktop app** instead. Delete the service account key in Cloud Console. |
+| `Error 403: access_denied` ("can only be accessed by developer-approved testers") | Your Gmail address isn't a test user. Add it under **Google Auth Platform → Audience → Test users**, in the project that owns `credentials.json`. |
+| `Gmail token ... could not be refreshed` / `invalid_grant` | The token expired (7 days in Testing mode) or access was revoked. Run `python archive.py --mode login`. Update the GitHub secrets if you use the workflows. |
+| `Cannot access bucket` | Check the bucket name, the `--region`, and your AWS credentials (`aws sts get-caller-identity`). |
+| Many `Gmail API 429` warnings | You are hitting Gmail's rate limit. Lower `--workers`. |
+| `No valid Gmail token ... no browser is available in CI` | The `GMAIL_TOKEN_READONLY` or `GMAIL_TOKEN_MODIFY` secret is missing or invalid. |
+
+## GitHub Actions
+
+Two workflows run the tool from GitHub. Both are triggered manually from the
+**Actions** tab (**Run workflow**):
+
+| Workflow | Gmail access | What it does |
+| --- | --- | --- |
+| **Ingest Gmail to S3** (`ingest.yml`) | read-only | Runs `archive`, then `verify`. Inputs: `query`, `limit`, `workers`, `storage_class`, `max_runtime`, `run_verify`. |
+| **Clean up Gmail mailbox** (`cleanup.yml`) | modify | Runs `cleanup`. Defaults to a dry run. A real run needs `dry_run` unchecked and `confirm` set to `TRASH`. |
+
+How the workflows behave:
+
+- **State is shared through S3.** Each run downloads
+  `s3://YOUR_BUCKET/state/archive_state.sqlite3`, works on it, and uploads it
+  again, even if the run fails part-way. Bucket versioning keeps older copies.
+- **Runs never overlap.** Both workflows share one concurrency group, so a second
+  run waits for the first to finish.
+- **Long jobs stop cleanly.** GitHub-hosted jobs are limited to 6 hours, so each run
+  stops after `max_runtime` minutes and saves its progress. Run the workflow again
+  to continue. For the first full migration of a large mailbox, running from your
+  Mac is simpler.
+- **AWS access uses OIDC.** GitHub signs in to an IAM role with short-lived
+  credentials. No AWS keys are stored in GitHub.
+
+### 1. Keep Google sign-ins from expiring
+
+While the OAuth app is in **Testing** mode, Google expires its tokens after 7 days.
+That would break the workflows.
+
+1. Open the consent screen settings. In newer consoles, go to **Google Auth Platform → Audience**.
+2. Click **Publish app** and set the status to **In production**.
+
+For personal use you don't need Google's verification. You'll still see the
+"Google hasn't verified this app" warning when you sign in.
+
+Then create both token files on your Mac:
+
+```bash
+python archive.py --mode login
+```
+
+A browser opens twice: first to approve read-only access, then to approve modify access.
+
+### 2. Create the AWS role for GitHub
+
+```bash
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+# One time per AWS account (skip if the GitHub OIDC provider already exists)
+aws iam create-open-id-connect-provider \
+  --url https://token.actions.githubusercontent.com \
+  --client-id-list sts.amazonaws.com
+
+sed "s/ACCOUNT_ID/$ACCOUNT_ID/" aws/github-oidc-trust.json > /tmp/gmail-archive-trust.json
+aws iam create-role --role-name gmail-archive-github \
+  --assume-role-policy-document file:///tmp/gmail-archive-trust.json \
+  --max-session-duration 21600
+aws iam put-role-policy --role-name gmail-archive-github \
+  --policy-name gmail-archive-s3 \
+  --policy-document file://aws/github-s3-policy.json
+```
+
+About these policies:
+
+- **Trust policy:** only allows runs from the `main` branch and from the
+  `mailbox-cleanup` environment of this repository.
+- **Permissions policy:** only allows listing the `gmailstore` bucket and reading
+  and writing its objects. Edit the bucket name if yours differs.
+- **Session length:** `--max-session-duration 21600` lets a run keep its AWS
+  credentials for up to 6 hours.
+
+### 3. Configure the repository
+
+```bash
+gh variable set S3_BUCKET --body gmailstore
+gh variable set AWS_REGION --body us-east-1
+gh secret set AWS_ROLE_ARN --body "arn:aws:iam::$ACCOUNT_ID:role/gmail-archive-github"
+gh secret set GMAIL_TOKEN_READONLY < token_readonly.json
+
+# The modify token is only available to the cleanup environment
+gh api -X PUT repos/shehuj/Gmail-to-Amazon_Archive/environments/mailbox-cleanup
+gh secret set GMAIL_TOKEN_MODIFY --env mailbox-cleanup < token_modify.json
+```
+
+For extra protection, add yourself as a **required reviewer** on the
+`mailbox-cleanup` environment: **Settings → Environments → mailbox-cleanup**. Every
+cleanup run then waits for your approval before it can touch the mailbox.
+
+Required reviewers are available on public repositories and on paid plans for
+private ones.
+
+### 4. Seed the state database
+
+If you have already archived from your Mac, upload your local state so the
+workflows continue from it instead of starting over:
+
+```bash
+aws s3 cp archive_state.sqlite3 s3://gmailstore/state/archive_state.sqlite3
+```
+
+From then on, the S3 copy is the source of truth. If you also run the script
+locally:
+
+1. Download the state database from S3 first.
+2. Run the script.
+3. Upload the state database back to S3.
+4. Never run locally while a workflow is running.
+
+### Running from the command line
+
+```bash
+gh workflow run ingest.yml -f limit=5000 -f workers=12
+gh workflow run cleanup.yml                                  # dry run
+gh workflow run cleanup.yml -f dry_run=false -f confirm=TRASH -f limit=1000
+gh run watch
+```
+
+Each run writes the archive state summary to the run's summary page.
