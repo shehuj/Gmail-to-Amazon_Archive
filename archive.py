@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS messages (
     trashed_at    TEXT,
     error         TEXT,
     message_id_header TEXT,
-    duplicate_of  TEXT
+    duplicate_of  TEXT,
+    storage_class TEXT
 );
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -91,7 +92,7 @@ def open_db(path):
     db.executescript(SCHEMA)
     # Add columns introduced after the first release to existing databases.
     columns = {r["name"] for r in db.execute("PRAGMA table_info(messages)")}
-    for column in ("message_id_header", "duplicate_of"):
+    for column in ("message_id_header", "duplicate_of", "storage_class"):
         if column not in columns:
             db.execute(f"ALTER TABLE messages ADD COLUMN {column} TEXT")
     db.executescript(
@@ -250,25 +251,87 @@ def check_bucket(s3, bucket):
         sys.exit(f"Cannot access bucket '{bucket}': {e}")
 
 
-def gmail_call(request, retries=6):
-    """Execute a Gmail API request, retrying rate limits, 5xx and network errors.
+class GmailRateLimiter:
+    """Spaces Gmail requests evenly across all worker threads.
 
-    Uses exponential backoff with jitter (about 1 minute in total before giving up).
+    Gmail allows 15,000 quota units per minute per user; message get/list/trash cost
+    5 units each, so about 50 requests/second. When Gmail still reports a quota error,
+    every worker pauses together and the rate drops by 20%. It then recovers by 10%
+    for each minute without quota errors, up to the configured maximum.
     """
-    for attempt in range(retries + 1):
+
+    def __init__(self, rate):
+        self.max_rate = self.rate = float(rate)
+        self.lock = threading.Lock()
+        self.next_slot = 0.0
+        self.paused_until = 0.0
+        self.last_change = time.monotonic()
+
+    def acquire(self):
+        with self.lock:
+            now = time.monotonic()
+            if self.rate < self.max_rate and now - self.last_change >= 60:
+                self.rate = min(self.max_rate, self.rate * 1.1)
+                self.last_change = now
+            slot = max(now, self.next_slot, self.paused_until)
+            self.next_slot = slot + 1 / self.rate
+        if slot > now:
+            time.sleep(slot - now)
+
+    def quota_exceeded(self, pause):
+        """Pause all workers for `pause` seconds and lower the rate."""
+        with self.lock:
+            now = time.monotonic()
+            if now + pause <= self.paused_until + 1:
+                return  # another worker already paused everyone
+            self.paused_until = now + pause
+            self.rate = max(1.0, self.rate * 0.8)
+            self.last_change = now
+            rate = self.rate
+        log.warning("Gmail quota reached; pausing all workers for %.0fs, then %.1f requests/s",
+                    pause, rate)
+
+
+# Replaced in main() with the --rate setting.
+gmail_limiter = GmailRateLimiter(40)
+
+
+def is_quota_error(e):
+    content = (e.content or b"").lower()
+    return e.resp.status == 429 or (
+        e.resp.status == 403
+        and (b"ratelimitexceeded" in content or b"quota exceeded" in content)
+    )
+
+
+def gmail_call(request, retries=6, quota_retries=12):
+    """Execute a Gmail API request through the shared rate limiter.
+
+    Quota errors pause all workers (up to a minute, since Gmail's quota is per minute)
+    and are retried up to `quota_retries` times. 5xx and network errors use
+    exponential backoff with jitter, up to `retries` times.
+    """
+    errors = quota_errors = 0
+    while True:
+        gmail_limiter.acquire()
         try:
             return request.execute()
         except HttpError as e:
-            status = e.resp.status
-            rate_limited = status == 403 and b"ratelimitexceeded" in (e.content or b"").lower()
-            if attempt == retries or not (status in (429, 500, 502, 503, 504) or rate_limited):
+            if is_quota_error(e):
+                quota_errors += 1
+                if quota_errors > quota_retries:
+                    raise
+                gmail_limiter.quota_exceeded(min(10 * 2 ** (quota_errors - 1), 60) + random.random())
+                continue
+            if e.resp.status not in (500, 502, 503, 504) or errors >= retries:
                 raise
-            reason = f"HTTP {status}"
+            reason = f"HTTP {e.resp.status}"
         except (OSError, httplib2.HttpLib2Error) as e:  # timeouts, resets, DNS, TLS
-            if attempt == retries:
+            if errors >= retries:
                 raise
             reason = type(e).__name__
-        delay = min(2 ** attempt, 32) + random.random()
+        errors += 1
+        delay = min(2 ** errors, 32) + random.random()
         log.warning("Gmail API %s, retrying in %.0fs", reason, delay)
         time.sleep(delay)
 
@@ -404,7 +467,8 @@ def archive_one(args, s3, gmail, dedupe, msg_id, force_upload=False):
     key = s3_key_for(args.prefix, msg_id, internal_date)
     message_id = message_id_header(raw)
     result = dict(thread_id=msg.get("threadId"), internal_date=internal_date, key=key,
-                  sha256=digest, size=len(raw), message_id=message_id, duplicate_of=None)
+                  sha256=digest, size=len(raw), message_id=message_id, duplicate_of=None,
+                  storage_class=None)
 
     original = dedupe.claim(msg_id, digest, message_id, key)
     if original:
@@ -437,6 +501,7 @@ def archive_one(args, s3, gmail, dedupe, msg_id, force_upload=False):
         if args.storage_class:
             put["StorageClass"] = args.storage_class
         s3.put_object(**put)
+        result["storage_class"] = args.storage_class or "STANDARD"
     except Exception:
         dedupe.release(msg_id, digest, message_id)
         raise
@@ -492,9 +557,10 @@ def cmd_archive(args):
                 db.execute(
                     "UPDATE messages SET thread_id=?, internal_date=?, s3_key=?, sha256=?, "
                     "size=?, message_id_header=?, duplicate_of=?, archived_at=?, error=NULL, "
-                    "verified_at=NULL, verify_error=NULL WHERE id=?",
+                    "verified_at=NULL, verify_error=NULL, "
+                    "storage_class=COALESCE(?, storage_class) WHERE id=?",
                     (r["thread_id"], r["internal_date"], r["key"], r["sha256"], r["size"],
-                     r["message_id"], r["duplicate_of"], now(), msg_id),
+                     r["message_id"], r["duplicate_of"], now(), r["storage_class"], msg_id),
                 )
                 counts[r["outcome"]] += 1
                 if r["outcome"] == "duplicate":
@@ -670,8 +736,76 @@ def cmd_cleanup(args):
 # status
 # --------------------------------------------------------------------------- #
 
+# S3 list prices in USD for us-east-1 (check https://aws.amazon.com/s3/pricing/).
+# storage: per GB-month; put/get: per 1,000 requests; retrieval: per GB read;
+# min_size: smallest billable object size in bytes.
+S3_PRICES = {
+    "STANDARD":            dict(storage=0.023,   put=0.005, get=0.0004, retrieval=0,    min_size=0),
+    "INTELLIGENT_TIERING": dict(storage=0.023,   put=0.005, get=0.0004, retrieval=0,    min_size=0),
+    "STANDARD_IA":         dict(storage=0.0125,  put=0.01,  get=0.001,  retrieval=0.01, min_size=128 * 1024),
+    "ONEZONE_IA":          dict(storage=0.01,    put=0.01,  get=0.001,  retrieval=0.01, min_size=128 * 1024),
+    "GLACIER_IR":          dict(storage=0.004,   put=0.02,  get=0.01,   retrieval=0.03, min_size=128 * 1024),
+    "DEEP_ARCHIVE":        dict(storage=0.00099, put=0.05,  get=0.0004, retrieval=0,    min_size=0),
+}
+# Intelligent-Tiering monitoring fee per 1,000 objects of 128 KB or more, per month.
+INTELLIGENT_TIERING_MONITORING = 0.0025
+GB = 1024 ** 3
+
+
+def human_bytes(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.2f} TB"
+
+
+def estimate_cost(db):
+    """Estimated S3 cost: (storage per month, one-time request cost so far, objects, reads).
+
+    Counts each uploaded object once (duplicates aren't uploaded). Reads are the
+    "already in S3" check on upload plus one verify download per verified object.
+    Excludes data transfer, which is free for the first 100 GB a month.
+    """
+    monthly = requests = 0.0
+    objects = reads = 0
+    for r in db.execute(
+        "SELECT COALESCE(storage_class, 'STANDARD') AS cls, COUNT(*) AS n, "
+        "COALESCE(SUM(size), 0) AS bytes, "
+        "COALESCE(SUM(CASE WHEN size >= 131072 THEN 1 ELSE 0 END), 0) AS large, "
+        "COALESCE(SUM(CASE WHEN verified_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS verified, "
+        "COALESCE(SUM(CASE WHEN verified_at IS NOT NULL THEN size ELSE 0 END), 0) AS verified_bytes "
+        "FROM messages WHERE archived_at IS NOT NULL AND duplicate_of IS NULL "
+        "GROUP BY cls"
+    ):
+        price = S3_PRICES.get(r["cls"], S3_PRICES["STANDARD"])
+        billable = r["bytes"]
+        if price["min_size"]:
+            billable = db.execute(
+                "SELECT COALESCE(SUM(MAX(size, ?)), 0) FROM messages WHERE archived_at IS NOT NULL "
+                "AND duplicate_of IS NULL AND COALESCE(storage_class, 'STANDARD') = ?",
+                (price["min_size"], r["cls"]),
+            ).fetchone()[0]
+        monthly += billable / GB * price["storage"]
+        if r["cls"] == "INTELLIGENT_TIERING":
+            monthly += r["large"] / 1000 * INTELLIGENT_TIERING_MONITORING
+        n_reads = r["n"] + r["verified"]
+        requests += (r["n"] * price["put"] + n_reads * price["get"]) / 1000
+        requests += r["verified_bytes"] / GB * price["retrieval"]
+        objects += r["n"]
+        reads += n_reads
+    return monthly, requests, objects, reads
+
+
+def usd(x):
+    return f"${x:,.2f}" if x >= 0.01 or x == 0 else f"${x:.4f}"
+
+
 def print_summary(db):
     q = lambda sql: db.execute(sql).fetchone()[0]  # noqa: E731
+    in_s3 = q("SELECT COALESCE(SUM(size), 0) FROM messages "
+              "WHERE archived_at IS NOT NULL AND duplicate_of IS NULL")
+    monthly, requests, objects, reads = estimate_cost(db)
     print(
         "\nState summary\n"
         f"  listed:         {q('SELECT COUNT(*) FROM messages')}\n"
@@ -681,7 +815,11 @@ def print_summary(db):
         f"  verified:       {q('SELECT COUNT(*) FROM messages WHERE verified_at IS NOT NULL')}\n"
         f"  verify errors:  {q('SELECT COUNT(*) FROM messages WHERE verify_error IS NOT NULL')}\n"
         f"  trashed:        {q('SELECT COUNT(*) FROM messages WHERE trashed_at IS NOT NULL')}\n"
-        f"  bytes in S3:    {q('SELECT COALESCE(SUM(size), 0) FROM messages WHERE archived_at IS NOT NULL AND duplicate_of IS NULL')}"
+        f"  bytes in S3:    {in_s3} ({human_bytes(in_s3)})\n"
+        "\nEstimated AWS cost (S3 list prices, us-east-1)\n"
+        f"  storage:        {usd(monthly)} per month\n"
+        f"  requests:       {usd(requests)} so far ({objects} uploads, {reads} reads)\n"
+        f"  total so far:   {usd(requests + monthly)} (requests + one month of storage)"
     )
 
 
@@ -716,6 +854,9 @@ def parse_args(argv=None):
     p.add_argument("--workers", type=int, default=8,
                    help="Parallel Gmail/S3 requests for archive/verify/cleanup (default 8). Gmail allows "
                         "roughly 50 message downloads per second per user.")
+    p.add_argument("--rate", type=float, default=40,
+                   help="Max Gmail requests per second across all workers (default 40). "
+                        "Gmail's per-user quota allows about 50.")
     p.add_argument("--storage-class", default=None,
                    help="S3 storage class, e.g. STANDARD_IA, GLACIER_IR, DEEP_ARCHIVE")
     p.add_argument("--kms-key-id", default=None, help="Use SSE-KMS with this key (default SSE-S3)")
@@ -739,6 +880,8 @@ def parse_args(argv=None):
         p.error("--bucket is required for archive and verify modes")
     if args.yes and not args.confirm:
         p.error("--yes requires --confirm")
+    if not 0 < args.rate <= 50:
+        p.error("--rate must be more than 0 and at most 50")
     if not 1 <= args.workers <= 64:
         p.error("--workers must be between 1 and 64")
     if args.limit < 0 or args.max_runtime < 0:
@@ -756,6 +899,10 @@ def main(argv=None):
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    # The Gmail client logs every rate-limit response itself; gmail_call reports them.
+    logging.getLogger("googleapiclient.http").setLevel(logging.ERROR)
+    global gmail_limiter
+    gmail_limiter = GmailRateLimiter(args.rate)
     # GitHub Actions cancels and timeouts send SIGTERM; handle it like Ctrl+C so
     # progress is committed before exiting.
     signal.signal(signal.SIGTERM, _raise_interrupt)
