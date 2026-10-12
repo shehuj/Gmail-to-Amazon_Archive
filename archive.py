@@ -21,14 +21,17 @@ import hashlib
 import json
 import logging
 import os
+import random
+import signal
 import sqlite3
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 
 import boto3
+import httplib2
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from google.auth.exceptions import RefreshError
@@ -44,6 +47,9 @@ SCOPE_MODIFY = "https://www.googleapis.com/auth/gmail.modify"
 # Separate token files so the read-only token can never be used to trash mail.
 TOKEN_READONLY = "token_readonly.json"
 TOKEN_MODIFY = "token_modify.json"
+
+# Recorded when Gmail returns 404 (message deleted since it was listed); not retried.
+NOT_FOUND = "not found in Gmail"
 
 log = logging.getLogger("archive")
 
@@ -153,9 +159,9 @@ def gmail_credentials(credentials_file, scope, token_file):
                 )
             flow = InstalledAppFlow.from_client_secrets_file(credentials_file, [scope])
             creds = flow.run_local_server(port=0)
-        with open(token_file, "w") as f:
+        fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             f.write(creds.to_json())
-        os.chmod(token_file, 0o600)
     return creds
 
 
@@ -173,33 +179,55 @@ class ThreadLocalGmail:
 
 
 def run_parallel(fn, items, workers, deadline=None):
-    """Yield (item, result, error) for fn(item), running up to `workers` at once.
+    """Yield (item, result, error) for fn(item) as each finishes, up to `workers` at once.
 
-    Submits in bounded chunks so a huge pending list doesn't create every future up front.
-    Stops submitting new chunks once `deadline` (a time.monotonic() value) has passed.
+    Keeps at most 2 x workers tasks in flight, so workers never wait on a slow batch and
+    a huge item list doesn't create every future up front. Stops submitting new work
+    once `deadline` (a time.monotonic() value) has passed.
     """
-    chunk = max(workers * 20, 100)
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for start in range(0, len(items), chunk):
-            if deadline and time.monotonic() >= deadline:
-                log.warning("--max-runtime reached; stopping after %d of %d. "
-                            "Run again to continue.", start, len(items))
+    pool = ThreadPoolExecutor(max_workers=workers)
+    in_flight = {}
+    pending = iter(items)
+    submitted = 0
+    exhausted = False
+    try:
+        while True:
+            while not exhausted and len(in_flight) < workers * 2:
+                if deadline and time.monotonic() >= deadline:
+                    log.warning("--max-runtime reached; stopping after %d of %d. "
+                                "Run again to continue.", submitted, len(items))
+                    exhausted = True
+                    break
+                item = next(pending, None)
+                if item is None:
+                    exhausted = True
+                    break
+                in_flight[pool.submit(fn, item)] = item
+                submitted += 1
+            if not in_flight:
                 return
-            batch = items[start:start + chunk]
-            futures = [(item, pool.submit(fn, item)) for item in batch]
-            for item, fut in futures:
-                try:
-                    yield item, fut.result(), None
-                except Exception as e:  # reported per message by the caller
-                    yield item, None, e
+            done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            for fut in done:
+                item = in_flight.pop(fut)
+                exc = fut.exception()
+                yield item, (None if exc else fut.result()), exc
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 class Progress:
-    def __init__(self, total, label):
-        self.total, self.label, self.start = total, label, time.monotonic()
+    """Logs throughput and ETA at most every `interval` seconds."""
+
+    def __init__(self, total, label, interval=30):
+        self.total, self.label, self.interval = total, label, interval
+        self.start = self.last = time.monotonic()
 
     def log(self, i, failed):
-        elapsed = time.monotonic() - self.start
+        t = time.monotonic()
+        if t - self.last < self.interval and i != self.total:
+            return
+        self.last = t
+        elapsed = t - self.start
         rate = i / elapsed if elapsed else 0
         eta = (self.total - i) / rate if rate else 0
         log.info("%s: %d/%d (failed %d) %.1f msg/s, ETA %dh%02dm",
@@ -223,38 +251,48 @@ def check_bucket(s3, bucket):
 
 
 def gmail_call(request, retries=6):
-    """Execute a Gmail API request with exponential backoff on rate limits / 5xx."""
-    for attempt in range(retries):
+    """Execute a Gmail API request, retrying rate limits, 5xx and network errors.
+
+    Uses exponential backoff with jitter (about 1 minute in total before giving up).
+    """
+    for attempt in range(retries + 1):
         try:
             return request.execute()
         except HttpError as e:
             status = e.resp.status
-            if status in (429, 500, 502, 503, 504) or (
-                status == 403 and b"rateLimitExceeded" in (e.content or b"")
-            ):
-                delay = min(2 ** attempt, 60)
-                log.warning("Gmail API %s, retrying in %ss", status, delay)
-                time.sleep(delay)
-                continue
-            raise
-    return request.execute()
+            rate_limited = status == 403 and b"ratelimitexceeded" in (e.content or b"").lower()
+            if attempt == retries or not (status in (429, 500, 502, 503, 504) or rate_limited):
+                raise
+            reason = f"HTTP {status}"
+        except (OSError, httplib2.HttpLib2Error) as e:  # timeouts, resets, DNS, TLS
+            if attempt == retries:
+                raise
+            reason = type(e).__name__
+        delay = min(2 ** attempt, 32) + random.random()
+        log.warning("Gmail API %s, retrying in %.0fs", reason, delay)
+        time.sleep(delay)
 
 
 # --------------------------------------------------------------------------- #
 # archive
 # --------------------------------------------------------------------------- #
 
-def list_messages(gmail, db, query):
-    """Populate the messages table with every message ID. Resumable via page token."""
-    if meta_get(db, "listing_complete") == query:
-        log.info("Message listing already complete for this query; skipping.")
-        return
+def list_messages(gmail, db, query, relist=False):
+    """Add message IDs from Gmail to the messages table.
+
+    The first listing walks every page and can be resumed via the saved page token.
+    After it completes, later runs list newest-first and stop at the first page with no
+    new IDs, so new mail is picked up quickly. `relist` forces a full listing again
+    (e.g. after importing old mail, which Gmail lists by its original date).
+    """
     if meta_get(db, "listing_query") != query:
         meta_set(db, "listing_query", query)
         meta_set(db, "listing_page_token", None)
-
-    page_token = meta_get(db, "listing_page_token")
-    total = 0
+        meta_set(db, "listing_complete", None)
+    incremental = meta_get(db, "listing_complete") == query and not relist
+    page_token = None if incremental else meta_get(db, "listing_page_token")
+    listed = new = 0
+    last_log = time.monotonic()
     while True:
         resp = gmail_call(
             gmail.users().messages().list(
@@ -262,18 +300,25 @@ def list_messages(gmail, db, query):
             )
         )
         msgs = resp.get("messages", [])
+        before = db.total_changes
         db.executemany(
             "INSERT OR IGNORE INTO messages (id, thread_id) VALUES (?, ?)",
             [(m["id"], m.get("threadId")) for m in msgs],
         )
-        db.commit()
-        total += len(msgs)
+        page_new = db.total_changes - before
+        listed += len(msgs)
+        new += page_new
         page_token = resp.get("nextPageToken")
-        meta_set(db, "listing_page_token", page_token)
-        log.info("Listed %d message IDs so far", total)
-        if not page_token:
+        if not incremental:
+            meta_set(db, "listing_page_token", page_token)  # also commits
+        db.commit()
+        if time.monotonic() - last_log >= 10:
+            log.info("Listed %d message IDs (%d new)", listed, new)
+            last_log = time.monotonic()
+        if not page_token or (incremental and page_new == 0):
             break
     meta_set(db, "listing_complete", query)
+    log.info("Listing done: %d message IDs checked, %d new", listed, new)
 
 
 def s3_key_for(prefix, msg_id, internal_date_ms):
@@ -351,7 +396,8 @@ def archive_one(args, s3, gmail, dedupe, msg_id, force_upload=False):
     there) or "duplicate" (same content as another archived message; not uploaded).
     `force_upload` skips the "already in S3" check, for objects that failed verification.
     """
-    msg = gmail_call(gmail.get().users().messages().get(userId="me", id=msg_id, format="raw"))
+    msg = gmail_call(gmail.get().users().messages().get(
+        userId="me", id=msg_id, format="raw", fields="id,threadId,internalDate,labelIds,raw"))
     raw = base64.urlsafe_b64decode(msg["raw"])
     digest = hashlib.sha256(raw).hexdigest()
     internal_date = int(msg.get("internalDate", 0))
@@ -398,17 +444,32 @@ def archive_one(args, s3, gmail, dedupe, msg_id, force_upload=False):
     return result
 
 
+def requeue_orphaned_duplicates(db):
+    """A duplicate is only safe while its original is archived. If the original's upload
+    failed (or the run stopped first), put the duplicate back in the queue."""
+    orphans = db.execute(
+        "UPDATE messages SET archived_at=NULL, duplicate_of=NULL, s3_key=NULL, verified_at=NULL "
+        "WHERE trashed_at IS NULL AND duplicate_of IN "
+        "(SELECT id FROM messages WHERE archived_at IS NULL)"
+    ).rowcount
+    db.commit()
+    if orphans:
+        log.warning("%d duplicates re-queued because their original is not archived", orphans)
+
+
 def cmd_archive(args):
     db = open_db(args.db)
     s3 = s3_client(args)
     check_bucket(s3, args.bucket)
     creds = gmail_credentials(args.credentials, SCOPE_READONLY, TOKEN_READONLY)
 
-    list_messages(build("gmail", "v1", credentials=creds, cache_discovery=False), db, args.query)
+    list_messages(build("gmail", "v1", credentials=creds, cache_discovery=False), db,
+                  args.query, args.relist)
 
     sql = (
-        "SELECT id, verify_error FROM messages WHERE (archived_at IS NULL OR verify_error IS NOT NULL) "
-        "AND trashed_at IS NULL ORDER BY id"
+        "SELECT id, verify_error FROM messages "
+        "WHERE (archived_at IS NULL OR verify_error IS NOT NULL) AND trashed_at IS NULL "
+        f"AND (error IS NULL OR error != '{NOT_FOUND}') ORDER BY id"
     )
     if args.limit:
         sql += f" LIMIT {int(args.limit)}"
@@ -423,44 +484,37 @@ def cmd_archive(args):
     progress = Progress(len(pending), "Archive")
     counts = {"uploaded": 0, "in_s3": 0, "duplicate": 0}
     failed = 0
-    results = run_parallel(lambda m: archive_one(args, s3, gmail, dedupe, m, m in reupload), pending,
-                           args.workers, deadline_for(args))
-    for i, (msg_id, r, err) in enumerate(results, 1):
-        if err is None:
-            db.execute(
-                "UPDATE messages SET thread_id=?, internal_date=?, s3_key=?, sha256=?, size=?, "
-                "message_id_header=?, duplicate_of=?, archived_at=?, error=NULL, "
-                "verified_at=NULL, verify_error=NULL WHERE id=?",
-                (r["thread_id"], r["internal_date"], r["key"], r["sha256"], r["size"],
-                 r["message_id"], r["duplicate_of"], now(), msg_id),
-            )
-            counts[r["outcome"]] += 1
-            if r["outcome"] == "duplicate":
-                log.debug("Duplicate %s of %s; not uploaded", msg_id, r["duplicate_of"])
-        else:
-            if isinstance(err, HttpError) and err.resp.status == 404:
-                # Deleted from Gmail since listing; nothing to archive.
-                msg = "not found in Gmail"
+    results = run_parallel(lambda m: archive_one(args, s3, gmail, dedupe, m, m in reupload),
+                           pending, args.workers, deadline_for(args))
+    try:
+        for i, (msg_id, r, err) in enumerate(results, 1):
+            if err is None:
+                db.execute(
+                    "UPDATE messages SET thread_id=?, internal_date=?, s3_key=?, sha256=?, "
+                    "size=?, message_id_header=?, duplicate_of=?, archived_at=?, error=NULL, "
+                    "verified_at=NULL, verify_error=NULL WHERE id=?",
+                    (r["thread_id"], r["internal_date"], r["key"], r["sha256"], r["size"],
+                     r["message_id"], r["duplicate_of"], now(), msg_id),
+                )
+                counts[r["outcome"]] += 1
+                if r["outcome"] == "duplicate":
+                    log.debug("Duplicate %s of %s; not uploaded", msg_id, r["duplicate_of"])
             else:
-                msg = f"{type(err).__name__}: {err}"[:500]
-            db.execute("UPDATE messages SET error=? WHERE id=?", (msg, msg_id))
-            failed += 1
-            log.error("Failed %s: %s", msg_id, msg)
-        if i % 100 == 0:
-            db.commit()
+                if isinstance(err, HttpError) and err.resp.status == 404:
+                    msg = NOT_FOUND  # deleted from Gmail since listing; nothing to archive
+                else:
+                    msg = f"{type(err).__name__}: {err}"[:500]
+                db.execute("UPDATE messages SET error=? WHERE id=?", (msg, msg_id))
+                failed += 1
+                log.error("Failed %s: %s", msg_id, msg)
+            if i % 200 == 0:
+                db.commit()
             progress.log(i, failed)
-    db.commit()
-
-    # A duplicate is only safe while its original is archived. If the original's upload
-    # failed, put the duplicate back in the queue so the next run archives it instead.
-    orphans = db.execute(
-        "UPDATE messages SET archived_at=NULL, duplicate_of=NULL, s3_key=NULL, verified_at=NULL "
-        "WHERE trashed_at IS NULL AND duplicate_of IN "
-        "(SELECT id FROM messages WHERE archived_at IS NULL)"
-    ).rowcount
-    db.commit()
-    if orphans:
-        log.warning("%d duplicates re-queued because their original failed to archive", orphans)
+    finally:
+        # Runs on Ctrl+C / SIGTERM too, so recorded progress is never lost.
+        results.close()  # stop the worker pool
+        db.commit()
+        requeue_orphaned_duplicates(db)
 
     log.info(
         "Archive finished: %d uploaded, %d already in S3, %d duplicates skipped, %d failed",
@@ -502,25 +556,29 @@ def cmd_verify(args):
 
     progress = Progress(len(rows), "Verify")
     ok = bad = 0
-    for i, (r, mismatch, exc) in enumerate(run_parallel(check, rows, args.workers, deadline_for(args)), 1):
-        err = mismatch or (exc and f"{type(exc).__name__}: {exc}"[:500])
-        if err:
-            bad += 1
-            log.error("Verify FAILED %s: %s", r["id"], err)
-            db.execute(
-                "UPDATE messages SET verified_at=NULL, verify_error=? WHERE id=?",
-                (err, r["id"]),
-            )
-        else:
-            ok += 1
-            db.execute(
-                "UPDATE messages SET verified_at=?, verify_error=NULL WHERE id=?",
-                (now(), r["id"]),
-            )
-        if i % 100 == 0:
-            db.commit()
+    results = run_parallel(check, rows, args.workers, deadline_for(args))
+    try:
+        for i, (r, mismatch, exc) in enumerate(results, 1):
+            err = mismatch or (exc and f"{type(exc).__name__}: {exc}"[:500])
+            if err:
+                bad += 1
+                log.error("Verify FAILED %s: %s", r["id"], err)
+                db.execute(
+                    "UPDATE messages SET verified_at=NULL, verify_error=? WHERE id=?",
+                    (err, r["id"]),
+                )
+            else:
+                ok += 1
+                db.execute(
+                    "UPDATE messages SET verified_at=?, verify_error=NULL WHERE id=?",
+                    (now(), r["id"]),
+                )
+            if i % 200 == 0:
+                db.commit()
             progress.log(i, bad)
-    db.commit()
+    finally:
+        results.close()  # stop the worker pool
+        db.commit()
 
     # Duplicates were not uploaded; they are verified when their original is.
     db.execute(
@@ -581,21 +639,30 @@ def cmd_cleanup(args):
         gmail_call(gmail.get().users().messages().trash(userId="me", id=msg_id))
 
     progress = Progress(len(ids), "Cleanup")
-    done = failed = 0
+    done = gone = failed = 0
     results = run_parallel(trash, ids, args.workers, deadline_for(args))
-    for i, (msg_id, _, err) in enumerate(results, 1):
-        if err is None:
-            db.execute("UPDATE messages SET trashed_at=? WHERE id=?", (now(), msg_id))
-            done += 1
-        else:
-            failed += 1
-            log.error("Trash failed %s: %s", msg_id, err)
-        if i % 100 == 0:
-            db.commit()
+    try:
+        for i, (msg_id, _, err) in enumerate(results, 1):
+            if err is None:
+                db.execute("UPDATE messages SET trashed_at=? WHERE id=?", (now(), msg_id))
+                done += 1
+            elif isinstance(err, HttpError) and err.resp.status == 404:
+                # Already deleted from Gmail; nothing left to trash.
+                db.execute("UPDATE messages SET trashed_at=?, error=? WHERE id=?",
+                           (now(), NOT_FOUND, msg_id))
+                gone += 1
+            else:
+                failed += 1
+                log.error("Trash failed %s: %s", msg_id, err)
+            if i % 200 == 0:
+                db.commit()
             progress.log(i, failed)
-    db.commit()
+    finally:
+        results.close()  # stop the worker pool
+        db.commit()
 
-    log.info("Cleanup finished: %d trashed, %d failed", done, failed)
+    log.info("Cleanup finished: %d trashed, %d already gone from Gmail, %d failed",
+             done, gone, failed)
     print_summary(db)
 
 
@@ -655,6 +722,8 @@ def parse_args(argv=None):
     p.add_argument("--no-dedupe-message-id", action="store_true",
                    help="archive: only treat byte-identical messages as duplicates, not "
                         "messages that share a Message-ID header")
+    p.add_argument("--relist", action="store_true",
+                   help="archive: list every message again instead of only new mail")
     p.add_argument("--reverify", action="store_true", help="verify: re-check already verified objects")
     p.add_argument("--confirm", action="store_true", help="cleanup: required to modify Gmail")
     p.add_argument("--yes", action="store_true",
@@ -670,7 +739,15 @@ def parse_args(argv=None):
         p.error("--bucket is required for archive and verify modes")
     if args.yes and not args.confirm:
         p.error("--yes requires --confirm")
+    if not 1 <= args.workers <= 64:
+        p.error("--workers must be between 1 and 64")
+    if args.limit < 0 or args.max_runtime < 0:
+        p.error("--limit and --max-runtime must be 0 or more")
     return args
+
+
+def _raise_interrupt(signum, frame):
+    raise KeyboardInterrupt
 
 
 def main(argv=None):
@@ -679,8 +756,15 @@ def main(argv=None):
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    {"archive": cmd_archive, "verify": cmd_verify,
-     "cleanup": cmd_cleanup, "status": cmd_status, "login": cmd_login}[args.mode](args)
+    # GitHub Actions cancels and timeouts send SIGTERM; handle it like Ctrl+C so
+    # progress is committed before exiting.
+    signal.signal(signal.SIGTERM, _raise_interrupt)
+    try:
+        {"archive": cmd_archive, "verify": cmd_verify,
+         "cleanup": cmd_cleanup, "status": cmd_status, "login": cmd_login}[args.mode](args)
+    except KeyboardInterrupt:
+        log.warning("Interrupted; progress so far is saved. Run the same command to continue.")
+        sys.exit(130)
 
 
 if __name__ == "__main__":
