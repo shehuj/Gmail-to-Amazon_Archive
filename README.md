@@ -7,13 +7,16 @@ Python · Gmail API · Boto3 · SQLite · AWS S3
 
 > **Status:**
 >
-> - **Tested with real Gmail and S3:** a small `archive` run.
-> - **Tested offline only** (fake Gmail and S3): parallel workers, duplicate
->   handling, `verify`, `cleanup`, `--max-runtime` and interrupt handling.
-> - **GitHub Actions workflows:** pass `actionlint`, and the configuration check was
->   tested locally. They have not yet completed a run on GitHub.
+> - **Tested with real Gmail and S3:**
+>   - `archive` from a Mac.
+>   - The **Ingest Gmail to S3** workflow on GitHub Actions, using access keys:
+>     new mail was picked up, the archive step uploaded 20 messages, `verify`
+>     passed 40 of 40, and the state database round trip through S3 worked.
+> - **Tested offline only** (fake Gmail and S3): duplicate handling, `cleanup`,
+>   `--max-runtime`, interrupt handling, and the OIDC role sign-in.
 >
-> Start each new stage with a small `--limit` run.
+> Start each new stage with a small `--limit` run. In particular, run the cleanup
+> workflow as a dry run before the first real cleanup.
 
 ## How it works
 
