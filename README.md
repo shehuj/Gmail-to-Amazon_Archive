@@ -10,10 +10,12 @@ Python · Gmail API · Boto3 · SQLite · AWS S3
 > - **Tested with real Gmail and S3:**
 >   - `archive` from a Mac.
 >   - The **Ingest Gmail to S3** workflow on GitHub Actions, using access keys:
->     new mail was picked up, the archive step uploaded 20 messages, `verify`
->     passed 40 of 40, and the state database round trip through S3 worked.
-> - **Tested offline only** (fake Gmail and S3): duplicate handling, `cleanup`,
->   `--max-runtime`, interrupt handling, and the OIDC role sign-in.
+>     6,010 messages (495 MB) archived and verified with 0 failures, the adaptive
+>     rate limiter settling at the default Gmail quota (about 1.5 messages per
+>     second), and the state database round trip through S3.
+> - **Tested offline only** (fake Gmail and S3): Takeout `import` (`.mbox`, `.zip`
+>   and `.tgz`), duplicate handling, `cleanup`, `--max-runtime`, interrupt handling,
+>   and the OIDC role sign-in.
 >
 > Start each new stage with a small `--limit` run. In particular, run the cleanup
 > workflow as a dry run before the first real cleanup.
@@ -28,6 +30,7 @@ The migration runs in separate, resumable stages:
 | `verify` | none | Downloads every archived object from S3 and compares its SHA-256 and size with the local manifest. |
 | `cleanup` | modify | Moves **verified** messages to Gmail Trash. Never empties Trash. |
 | `status` | none | Prints counts of listed, archived, verified and trashed messages. |
+| `import` | none | Imports a Google Takeout export (`.mbox`, or the `.zip`/`.tgz` archives) into S3 without using the Gmail API quota. See [Bulk import with Google Takeout](#bulk-import-with-google-takeout). |
 | `login` | both | Authorizes both Gmail scopes in a browser and saves the token files, e.g. for GitHub Actions secrets. |
 
 Objects are stored as:
@@ -70,11 +73,12 @@ How duplicates are handled after archiving:
 
 | File | Purpose |
 | --- | --- |
-| `archive.py` | Archive, verify, gated cleanup, status and login modes |
+| `archive.py` | Archive, import, verify, gated cleanup, status and login modes |
 | `requirements.txt` | Python dependencies |
 | `.github/workflows/ingest.yml` | Manually triggered GitHub Actions workflow: archive + verify |
 | `.github/workflows/cleanup.yml` | Manually triggered GitHub Actions workflow: move verified mail to Trash |
 | `aws/` | IAM trust and permissions policies for the GitHub Actions role, and the S3 lifecycle rule |
+| `PRIVACY.md` | Privacy policy, linked from the Google OAuth consent screen |
 | `.gitignore` | Keeps credentials, OAuth tokens and local state out of git |
 
 ## Setup
@@ -191,12 +195,17 @@ progress lines:
 python archive.py --mode archive --bucket YOUR_BUCKET --region us-east-1 --limit 2000
 ```
 
-Then archive everything. `caffeinate -i` keeps your Mac awake. Raise `--workers`
-for speed, and lower it if you see `Gmail API 429` warnings:
+Then archive everything. `caffeinate -i` keeps your Mac awake:
 
 ```bash
-caffeinate -i python archive.py --mode archive --bucket YOUR_BUCKET --region us-east-1 --workers 12
+caffeinate -i python archive.py --mode archive --bucket YOUR_BUCKET --region us-east-1 --sync-state
 ```
+
+Speed is limited by the Gmail quota, not by `--workers`: at the default quota
+expect about 1.5 messages per second, or roughly 5,000 an hour. For a mailbox
+with more than a few tens of thousands of messages, use
+[Google Takeout](#bulk-import-with-google-takeout) for the bulk and `archive` for
+new mail.
 
 The first run lists every message ID, which takes a few minutes for a large
 mailbox. Later runs only look for new mail, newest first, and stop at the first page
@@ -268,6 +277,71 @@ Before emptying Trash yourself, check two things:
 - The archived messages and attachments can be retrieved from S3.
 - Your Gmail storage has decreased as expected.
 
+### Bulk import with Google Takeout
+
+The Gmail API quota allows only about 1.5 full message downloads per second (see
+Important notes), so archiving a large mailbox through the API takes days. A
+Google Takeout export avoids the quota: it has every message in one `.mbox` file,
+which `import` uploads as fast as your connection allows. Use Takeout for the
+bulk of the mailbox; `archive` and the ingest workflow then pick up new mail.
+
+**1. Export your mail.**
+
+1. Go to <https://takeout.google.com> and click **Deselect all**.
+2. Select **Mail**. Optionally, under **All Mail data included**, choose specific labels.
+3. Click **Next step** and choose these options:
+   - Transfer **Send download link via email**
+   - Frequency **Export once**
+   - File type **.zip** or **.tgz**
+   - Size **50 GB**, so the mailbox fits in as few files as possible
+4. Click **Create export**. Google emails a link when it's ready, which can take
+   hours or a day. Download the files; you don't need to extract them.
+
+**2. Do a dry run.** It downloads the current state database from S3 and reports
+what would be imported, without uploading anything:
+
+```bash
+python archive.py --mode import --takeout ~/Downloads/takeout-*.zip \
+  --bucket YOUR_BUCKET --region us-east-1 --sync-state --dry-run
+```
+
+Check the **match rate**. Takeout identifies each message by its Gmail message
+ID, which the import converts to the ID the Gmail API uses. A high match rate
+confirms the export lines up with the state database, so `cleanup` and the API
+workflow treat imported messages correctly. Messages that arrived after the API
+listing show as "not listed"; that's expected.
+
+**3. Run the import.** Don't run the GitHub workflows while it runs, because both
+would update the shared state database.
+
+```bash
+caffeinate -i python archive.py --mode import --takeout ~/Downloads/takeout-*.zip \
+  --bucket YOUR_BUCKET --region us-east-1 --sync-state --workers 16
+```
+
+What the import does:
+
+- It skips Spam, Trash and Chat (like the API listing), messages already archived,
+  and duplicates (same `Message-ID`).
+- Before uploading anything, it checks that the first 2,000 messages match the
+  state database. If fewer than 90% match, it stops. This guards against using the
+  wrong state database, which would store messages under IDs that `cleanup` can't use.
+- Progress shows the percentage of the export read and an ETA. You can stop with
+  Ctrl+C and run the same command again; finished messages are skipped.
+- `--sync-state` uploads the state database at the end, even after an error or
+  Ctrl+C.
+
+Takeout messages are stored with two extra headers Google adds, `X-GM-THRID` and
+`X-Gmail-Labels`, so their checksums differ from API downloads of the same message.
+The `Message-ID` duplicate check still recognises them.
+
+**4. Verify.** Run the ingest workflow with a small limit; its verify step checks
+every message the import uploaded:
+
+```bash
+gh workflow run ingest.yml -f limit=1
+```
+
 ### Check progress at any time
 
 ```bash
@@ -299,8 +373,8 @@ Check your AWS bill for actual charges.
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `--mode` | (required) | `archive`, `verify`, `cleanup`, `status` or `login` |
-| `--bucket` | (none) | S3 bucket. Required for `archive` and `verify`. |
+| `--mode` | (required) | `archive`, `import`, `verify`, `cleanup`, `status` or `login` |
+| `--bucket` | (none) | S3 bucket. Required for `archive`, `verify` and `import` (except an `import` dry run without `--sync-state`). |
 | `--region` | AWS config | AWS region, e.g. `us-east-1` |
 | `--profile` | AWS default | AWS CLI profile name |
 | `--prefix` | `gmail` | S3 key prefix |
@@ -308,14 +382,17 @@ Check your AWS bill for actual charges.
 | `--credentials` | `credentials.json` | Google OAuth client file |
 | `--query` | (all mail) | Gmail search query. Spam and Trash are always excluded. |
 | `--limit` | 0 (no limit) | Process at most N messages in this run |
-| `--rate` | 40 | Maximum Gmail requests per second, shared by all workers. Gmail's per-user quota allows about 50. |
-| `--workers` | 8 | Parallel requests for `archive`, `verify` and `cleanup`. Gmail allows roughly 50 message requests per second per user. |
+| `--rate` | 20 | Maximum Gmail requests per second, shared by all workers. The script lowers it automatically to fit your Gmail quota and remembers the rate that worked. |
+| `--workers` | 8 | Parallel requests for `archive`, `import`, `verify` and `cleanup`. For `archive`, the Gmail quota limits speed more than workers do. For `import` and `verify`, more workers mean faster S3 transfers. |
 | `--storage-class` | `STANDARD` | e.g. `STANDARD_IA`, `GLACIER_IR`, `INTELLIGENT_TIERING`, `DEEP_ARCHIVE` |
 | `--kms-key-id` | (SSE-S3) | Encrypt with SSE-KMS using this key |
+| `--takeout` | | `import`: Takeout `.mbox` files, `.zip`/`.tgz` archives or folders. Archives are read without extracting. |
+| `--allow-unmatched` | off | `import`: continue even if Takeout IDs don't match the state database |
+| `--sync-state` | off | Download the state database from `s3://BUCKET/state/` before the run and upload it afterwards. Use it for every local run once the workflows are in use. |
 | `--relist` | off | `archive`: list every message again instead of only new mail |
 | `--no-dedupe-message-id` | off | `archive`: only treat byte-identical messages as duplicates, not messages sharing a `Message-ID` |
 | `--reverify` | off | `verify`: re-check objects that already passed |
-| `--dry-run` | off | `cleanup`: show the count only, change nothing |
+| `--dry-run` | off | `cleanup` and `import`: report what would happen, change nothing |
 | `--confirm` | off | `cleanup`: required to modify Gmail |
 | `--yes` | off | `cleanup`: skip the typed confirmation, for automation. Requires `--confirm`. |
 | `--max-runtime` | 0 (no limit) | Stop `archive`, `verify` or `cleanup` cleanly after N minutes. Run again to continue. |
@@ -343,13 +420,22 @@ Storage class notes:
 
 - **Never commit secrets.** `credentials.json`, `token_*.json` and the database are
   excluded by `.gitignore`.
-- **Gmail quota.** Gmail allows each user about 50 message requests per second.
-  All workers share one rate limit (`--rate`, default 40 per second), so adding
-  workers never exceeds the quota.
-  - If Gmail still reports `Quota exceeded` or `rateLimitExceeded`, every worker
-    pauses together for 10–60 seconds. The rate then drops by 20% and recovers
-    gradually.
+- **Gmail quota.** Gmail limits each user to a number of quota units per minute.
+  New projects get **6,000**; older ones had 15,000. Downloading a full message
+  costs far more units than other calls: in practice about **1.5 messages per
+  second** at 6,000 units. All workers share one adaptive rate limit, which
+  handles this automatically:
+  - On a quota error, every worker pauses together and the rate drops by 30%.
+    Errors from requests already in flight count as the same event.
+  - The rate rises by 5% after each minute without errors, up to `--rate`.
+  - The rate a run ends at is saved in the state database. The next run starts
+    there, including runs on GitHub Actions.
   - A message is only marked failed after 12 quota errors.
+
+  To go faster, raise the quota: in Google Cloud Console, open **APIs & Services →
+  Gmail API → Quotas & System Limits**, choose ⋮ → **Edit quota** on **Units per
+  minute per user**, and request a higher value, for example 15,000. The script
+  speeds up on its own once the new quota applies.
 - **Network errors.** 5xx errors, timeouts and dropped connections are retried with
   exponential backoff. S3 requests use the AWS SDK's adaptive retries.
 - **Large mailboxes take hours.** Runs can be stopped and resumed at any time.
@@ -376,7 +462,7 @@ Storage class notes:
 | `Error 403: access_denied` ("can only be accessed by developer-approved testers") | Your Gmail address isn't a test user. Add it under **Google Auth Platform → Audience → Test users**, in the project that owns `credentials.json`. |
 | `Gmail token ... could not be refreshed` / `invalid_grant` | The token expired (7 days in Testing mode) or access was revoked. Run `python archive.py --mode login`. Update the GitHub secrets if you use the workflows. |
 | `Cannot access bucket` | Check the bucket name, the `--region`, and your AWS credentials (`aws sts get-caller-identity`). |
-| Many `Gmail quota reached; pausing all workers` warnings | Expected once or twice per run. If they keep repeating, lower `--rate`, e.g. `--rate 30`. |
+| `Gmail quota reached; pausing all workers` warnings | Expected a few times per run while the script finds your quota. A steady rate of about 1.5 messages a second means you are at the default 6,000 units-per-minute quota. Request a higher quota to go faster (see Important notes). |
 | `No valid Gmail token ... no browser is available in CI` | The `GMAIL_TOKEN_READONLY` or `GMAIL_TOKEN_MODIFY` secret is missing or invalid. |
 
 ## GitHub Actions
@@ -402,8 +488,10 @@ How the workflows behave:
   run waits for the first to finish.
 - **Long jobs stop cleanly.** GitHub-hosted jobs are limited to 6 hours. Each run
   stops after `max_runtime` minutes and saves its progress. A cancelled run also
-  saves its progress. Run the workflow again to continue. For the first full
-  migration of a large mailbox, running from your Mac is simpler.
+  saves its progress. Run the workflow again to continue. At the default Gmail
+  quota a run archives about 5,000 messages an hour, so for the first full
+  migration of a large mailbox use [Google Takeout](#bulk-import-with-google-takeout)
+  instead.
 
 ### Required settings
 
@@ -531,11 +619,10 @@ aws s3 cp archive_state.sqlite3 s3://gmailstore/state/archive_state.sqlite3
 From then on, the S3 copy is the source of truth. If you also run the script
 locally:
 
-1. Download the state database from S3 first:
-   `aws s3 cp s3://gmailstore/state/archive_state.sqlite3 .`
-2. Run the script.
-3. Upload the state database back to S3.
-4. Never run locally while a workflow is running.
+- Add `--sync-state` to every local run. It downloads the state database from S3
+  before the run (keeping the old local copy as `archive_state.sqlite3.bak`) and
+  uploads it afterwards.
+- Never run locally while a workflow is running.
 
 ### 5. Run the workflows
 
@@ -543,7 +630,7 @@ In the **Actions** tab, choose a workflow and click **Run workflow**. Or use the
 command line:
 
 ```bash
-gh workflow run ingest.yml -f limit=5000 -f workers=12
+gh workflow run ingest.yml -f limit=5000 -f workers=4
 gh workflow run cleanup.yml                                  # dry run
 gh workflow run cleanup.yml -f dry_run=false -f confirm=TRASH -f limit=1000
 gh run watch

@@ -8,6 +8,9 @@ Modes (run in this order):
            against the local manifest.
   cleanup  Moves *verified* messages to Gmail Trash. Requires --confirm and a
            typed confirmation (or --yes). Never empties Trash.
+  import   Imports a Google Takeout export (.mbox, or the .zip/.tgz archives) into
+           S3 without using the Gmail API quota. Use it for the bulk of a large
+           mailbox; `archive` then picks up new mail.
   login    Authorizes both Gmail scopes in a browser and saves the token files,
            e.g. to copy into GitHub Actions secrets.
 
@@ -16,16 +19,22 @@ Progress is tracked in a local SQLite database so every mode is resumable.
 
 import argparse
 import base64
+import email.errors
+import email.header
 import email.parser
+import email.utils
 import hashlib
 import json
 import logging
 import os
 import random
+import re
 import signal
 import sqlite3
 import sys
+import tarfile
 import threading
+import zipfile
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
@@ -73,7 +82,8 @@ CREATE TABLE IF NOT EXISTS messages (
     error         TEXT,
     message_id_header TEXT,
     duplicate_of  TEXT,
-    storage_class TEXT
+    storage_class TEXT,
+    source        TEXT
 );
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -92,7 +102,7 @@ def open_db(path):
     db.executescript(SCHEMA)
     # Add columns introduced after the first release to existing databases.
     columns = {r["name"] for r in db.execute("PRAGMA table_info(messages)")}
-    for column in ("message_id_header", "duplicate_of", "storage_class"):
+    for column in ("message_id_header", "duplicate_of", "storage_class", "source"):
         if column not in columns:
             db.execute(f"ALTER TABLE messages ADD COLUMN {column} TEXT")
     db.executescript(
@@ -179,7 +189,7 @@ class ThreadLocalGmail:
         return self.local.service
 
 
-def run_parallel(fn, items, workers, deadline=None):
+def run_parallel(fn, items, workers, deadline=None):  # items: list or iterator
     """Yield (item, result, error) for fn(item) as each finishes, up to `workers` at once.
 
     Keeps at most 2 x workers tasks in flight, so workers never wait on a slow batch and
@@ -195,8 +205,9 @@ def run_parallel(fn, items, workers, deadline=None):
         while True:
             while not exhausted and len(in_flight) < workers * 2:
                 if deadline and time.monotonic() >= deadline:
-                    log.warning("--max-runtime reached; stopping after %d of %d. "
-                                "Run again to continue.", submitted, len(items))
+                    total = f" of {len(items)}" if hasattr(items, "__len__") else ""
+                    log.warning("--max-runtime reached; stopping after %d%s. "
+                                "Run again to continue.", submitted, total)
                     exhausted = True
                     break
                 item = next(pending, None)
@@ -252,26 +263,35 @@ def check_bucket(s3, bucket):
 
 
 class GmailRateLimiter:
-    """Spaces Gmail requests evenly across all worker threads.
+    """Spaces Gmail requests evenly across all worker threads and adapts to the quota.
 
-    Gmail allows 15,000 quota units per minute per user; message get/list/trash cost
-    5 units each, so about 50 requests/second. When Gmail still reports a quota error,
-    every worker pauses together and the rate drops by 20%. It then recovers by 10%
-    for each minute without quota errors, up to the configured maximum.
+    Gmail's per-user quota is measured in units per minute (6,000 by default for new
+    projects), and downloading a full raw message costs far more units than metadata
+    calls, so the safe rate can't be known up front. The limiter learns it:
+
+    - On a quota error, every worker pauses together and the rate drops by 30%.
+      Errors from requests already in flight during that pause are ignored, so one
+      burst counts as one event.
+    - After each minute without quota errors, the rate rises by 5%, up to `max_rate`.
+    - The rate reached is saved in the state database, and the next run starts there.
     """
 
-    def __init__(self, rate):
-        self.max_rate = self.rate = float(rate)
+    MIN_RATE = 0.2
+
+    def __init__(self, rate, max_rate=None):
+        self.rate = float(rate)
+        self.max_rate = float(max_rate or rate)
         self.lock = threading.Lock()
         self.next_slot = 0.0
         self.paused_until = 0.0
+        self.ignore_errors_until = 0.0
         self.last_change = time.monotonic()
 
     def acquire(self):
         with self.lock:
             now = time.monotonic()
             if self.rate < self.max_rate and now - self.last_change >= 60:
-                self.rate = min(self.max_rate, self.rate * 1.1)
+                self.rate = min(self.max_rate, self.rate * 1.05)
                 self.last_change = now
             slot = max(now, self.next_slot, self.paused_until)
             self.next_slot = slot + 1 / self.rate
@@ -279,21 +299,37 @@ class GmailRateLimiter:
             time.sleep(slot - now)
 
     def quota_exceeded(self, pause):
-        """Pause all workers for `pause` seconds and lower the rate."""
+        """Pause all workers for `pause` seconds and lower the rate (once per burst)."""
         with self.lock:
             now = time.monotonic()
-            if now + pause <= self.paused_until + 1:
-                return  # another worker already paused everyone
+            if now < self.ignore_errors_until:
+                return  # a request sent before the last pause; already handled
             self.paused_until = now + pause
-            self.rate = max(1.0, self.rate * 0.8)
-            self.last_change = now
+            # Requests in flight finish within a few seconds of the pause starting.
+            self.ignore_errors_until = now + pause + 5
+            self.rate = max(self.MIN_RATE, self.rate * 0.7)
+            self.last_change = now + pause
             rate = self.rate
-        log.warning("Gmail quota reached; pausing all workers for %.0fs, then %.1f requests/s",
+        log.warning("Gmail quota reached; pausing all workers for %.0fs, then %.2f requests/s",
                     pause, rate)
 
 
-# Replaced in main() with the --rate setting.
+# Replaced by configure_gmail_rate() with the --rate setting and the learned rate.
 gmail_limiter = GmailRateLimiter(40)
+
+
+def configure_gmail_rate(db, args):
+    """Start at the rate the last run ended at (if any), capped by --rate."""
+    global gmail_limiter
+    learned = meta_get(db, "gmail_rate")
+    start = min(args.rate, float(learned) * 1.1) if learned else args.rate
+    gmail_limiter = GmailRateLimiter(start, max_rate=args.rate)
+    log.info("Gmail rate: starting at %.2f requests/s%s (max %.0f)", start,
+             " (learned from previous runs)" if learned else "", args.rate)
+
+
+def save_gmail_rate(db):
+    meta_set(db, "gmail_rate", f"{gmail_limiter.rate:.3f}")
 
 
 def is_quota_error(e):
@@ -452,21 +488,18 @@ def s3_has_object(s3, bucket, key, digest):
     return head.get("Metadata", {}).get("sha256") == digest
 
 
-def archive_one(args, s3, gmail, dedupe, msg_id, force_upload=False):
-    """Download one message from Gmail and upload it to S3. Runs in a worker thread.
+def store_message(args, s3, dedupe, msg_id, raw, thread_id, internal_date, labels,
+                  force_upload=False):
+    """Upload one raw message to S3 unless it is a duplicate or already there.
 
     Returns a dict whose "outcome" is "uploaded", "in_s3" (identical object already
     there) or "duplicate" (same content as another archived message; not uploaded).
     `force_upload` skips the "already in S3" check, for objects that failed verification.
     """
-    msg = gmail_call(gmail.get().users().messages().get(
-        userId="me", id=msg_id, format="raw", fields="id,threadId,internalDate,labelIds,raw"))
-    raw = base64.urlsafe_b64decode(msg["raw"])
     digest = hashlib.sha256(raw).hexdigest()
-    internal_date = int(msg.get("internalDate", 0))
     key = s3_key_for(args.prefix, msg_id, internal_date)
     message_id = message_id_header(raw)
-    result = dict(thread_id=msg.get("threadId"), internal_date=internal_date, key=key,
+    result = dict(thread_id=thread_id, internal_date=internal_date, key=key,
                   sha256=digest, size=len(raw), message_id=message_id, duplicate_of=None,
                   storage_class=None)
 
@@ -488,9 +521,9 @@ def archive_one(args, s3, gmail, dedupe, msg_id, force_upload=False):
             ChecksumSHA256=base64.b64encode(bytes.fromhex(digest)).decode(),
             Metadata={
                 "gmail-id": msg_id,
-                "gmail-thread-id": msg.get("threadId", ""),
+                "gmail-thread-id": thread_id or "",
                 "gmail-internal-date": str(internal_date),
-                "gmail-labels": ",".join(msg.get("labelIds", []))[:1500],
+                "gmail-labels": metadata_ascii(",".join(labels))[:1500],
                 "sha256": digest,
             },
         )
@@ -507,6 +540,32 @@ def archive_one(args, s3, gmail, dedupe, msg_id, force_upload=False):
         raise
     result["outcome"] = "uploaded"
     return result
+
+
+def metadata_ascii(value):
+    """S3 user metadata must be ASCII; Takeout label names can contain any characters."""
+    return value.encode("ascii", "backslashreplace").decode("ascii")
+
+
+def archive_one(args, s3, gmail, dedupe, msg_id, force_upload=False):
+    """Download one message from Gmail and store it in S3. Runs in a worker thread."""
+    msg = gmail_call(gmail.get().users().messages().get(
+        userId="me", id=msg_id, format="raw", fields="id,threadId,internalDate,labelIds,raw"))
+    raw = base64.urlsafe_b64decode(msg["raw"])
+    return store_message(args, s3, dedupe, msg_id, raw, msg.get("threadId"),
+                         int(msg.get("internalDate", 0)), msg.get("labelIds", []), force_upload)
+
+
+def record_stored(db, msg_id, r, source):
+    """Record a store_message() result in the state database (main thread only)."""
+    db.execute(
+        "UPDATE messages SET thread_id=COALESCE(?, thread_id), internal_date=?, s3_key=?, "
+        "sha256=?, size=?, message_id_header=?, duplicate_of=?, archived_at=?, error=NULL, "
+        "verified_at=NULL, verify_error=NULL, storage_class=COALESCE(?, storage_class), "
+        "source=? WHERE id=?",
+        (r["thread_id"], r["internal_date"], r["key"], r["sha256"], r["size"],
+         r["message_id"], r["duplicate_of"], now(), r["storage_class"], source, msg_id),
+    )
 
 
 def requeue_orphaned_duplicates(db):
@@ -527,6 +586,7 @@ def cmd_archive(args):
     s3 = s3_client(args)
     check_bucket(s3, args.bucket)
     creds = gmail_credentials(args.credentials, SCOPE_READONLY, TOKEN_READONLY)
+    configure_gmail_rate(db, args)
 
     list_messages(build("gmail", "v1", credentials=creds, cache_discovery=False), db,
                   args.query, args.relist)
@@ -554,14 +614,7 @@ def cmd_archive(args):
     try:
         for i, (msg_id, r, err) in enumerate(results, 1):
             if err is None:
-                db.execute(
-                    "UPDATE messages SET thread_id=?, internal_date=?, s3_key=?, sha256=?, "
-                    "size=?, message_id_header=?, duplicate_of=?, archived_at=?, error=NULL, "
-                    "verified_at=NULL, verify_error=NULL, "
-                    "storage_class=COALESCE(?, storage_class) WHERE id=?",
-                    (r["thread_id"], r["internal_date"], r["key"], r["sha256"], r["size"],
-                     r["message_id"], r["duplicate_of"], now(), r["storage_class"], msg_id),
-                )
+                record_stored(db, msg_id, r, "gmail-api")
                 counts[r["outcome"]] += 1
                 if r["outcome"] == "duplicate":
                     log.debug("Duplicate %s of %s; not uploaded", msg_id, r["duplicate_of"])
@@ -581,10 +634,277 @@ def cmd_archive(args):
         results.close()  # stop the worker pool
         db.commit()
         requeue_orphaned_duplicates(db)
+        save_gmail_rate(db)
 
     log.info(
         "Archive finished: %d uploaded, %d already in S3, %d duplicates skipped, %d failed",
         counts["uploaded"], counts["in_s3"], counts["duplicate"], failed,
+    )
+    print_summary(db)
+
+
+# --------------------------------------------------------------------------- #
+# import (Google Takeout)
+# --------------------------------------------------------------------------- #
+
+# Each message in a Takeout mbox starts with "From <X-GM-MSGID>@xxx <date>". The
+# number is the Gmail message ID in decimal; the Gmail API uses the same ID in hex.
+TAKEOUT_FROM = re.compile(rb"^From (\d+)@xxx (.*?)\r?\n?$")
+# Labels whose messages the API listing excludes, so the import skips them too.
+SKIP_LABELS = {"spam", "trash", "chat", "chats"}
+MBOXRD_ESCAPE = re.compile(rb"^>(>*From )")
+
+
+def takeout_files(paths):
+    """Expand the --takeout paths into a sorted list of .mbox/.zip/.tgz files."""
+    files = []
+    for path in paths:
+        if os.path.isdir(path):
+            for root, _, names in os.walk(path):
+                files += [os.path.join(root, n) for n in sorted(names)
+                          if n.lower().endswith((".mbox", ".zip", ".tgz", ".tar.gz"))]
+        elif os.path.exists(path):
+            files.append(path)
+        else:
+            sys.exit(f"Takeout path not found: {path}")
+    return files
+
+
+def takeout_sources(files):
+    """Yield (label, binary stream, file on disk, index) for every .mbox in `files`.
+
+    Reads .mbox files directly and Takeout .zip/.tgz archives without extracting them.
+    The file on disk's tell() gives progress, also through compressed archives.
+    """
+    for index, path in enumerate(files):
+        lower = path.lower()
+        with open(path, "rb") as raw:
+            if lower.endswith(".mbox"):
+                yield path, raw, raw, index
+            elif lower.endswith(".zip"):
+                with zipfile.ZipFile(raw) as zf:
+                    for name in zf.namelist():
+                        if name.lower().endswith(".mbox"):
+                            with zf.open(name) as member:
+                                yield f"{path}:{name}", member, raw, index
+            elif lower.endswith((".tgz", ".tar.gz")):
+                with tarfile.open(fileobj=raw, mode="r|gz") as tf:
+                    for member in tf:
+                        if member.isfile() and member.name.lower().endswith(".mbox"):
+                            yield f"{path}:{member.name}", tf.extractfile(member), raw, index
+            else:
+                log.warning("Skipping %s: not an .mbox, .zip or .tgz file", path)
+
+
+def iter_mbox(stream):
+    """Yield (from_line, raw message bytes) from an mbox stream, one message at a time.
+
+    Handles the mboxrd ">From " escaping Takeout uses and drops the blank line that
+    separates messages. Memory use is one message at a time.
+    """
+    from_line, lines, prev_blank = None, [], True
+    for line in stream:
+        if line.startswith(b"From ") and (prev_blank or TAKEOUT_FROM.match(line)):
+            if from_line is not None:
+                yield from_line, finish_mbox_message(lines)
+            from_line, lines = line, []
+        elif from_line is not None:
+            lines.append(MBOXRD_ESCAPE.sub(rb"\1", line))
+        prev_blank = line in (b"\n", b"\r\n")
+    if from_line is not None:
+        yield from_line, finish_mbox_message(lines)
+
+
+def finish_mbox_message(lines):
+    raw = b"".join(lines)
+    if raw.endswith(b"\r\n\r\n"):
+        return raw[:-2]
+    if raw.endswith(b"\n\n"):
+        return raw[:-1]
+    return raw
+
+
+def raw_header(raw, name):
+    """Return a header's value from raw message bytes, decoded to text.
+
+    Reads the bytes directly so UTF-8 label names survive (the email parser replaces
+    non-ASCII bytes), unfolds continuation lines and decodes =?UTF-8?...?= words.
+    """
+    head = raw.split(b"\r\n\r\n", 1)[0].split(b"\n\n", 1)[0]
+    m = re.search(rb"(?im)^" + re.escape(name.encode()) + rb":[ \t]*(.*(?:\r?\n[ \t].*)*)", head)
+    if not m:
+        return ""
+    text = re.sub(rb"\r?\n[ \t]+", b" ", m.group(1)).strip().decode("utf-8", "replace")
+    try:
+        return str(email.header.make_header(email.header.decode_header(text)))
+    except (email.errors.HeaderParseError, LookupError, UnicodeDecodeError):
+        return text
+
+
+def parse_takeout_message(from_line, raw):
+    """Return (gmail_id or None, thread_id, labels, internal_date_ms) for a Takeout message."""
+    m = TAKEOUT_FROM.match(from_line)
+    gmail_id = format(int(m.group(1)), "x") if m else None
+    headers = email.parser.BytesHeaderParser().parsebytes(raw)
+    thrid = raw_header(raw, "X-GM-THRID")
+    thread_id = format(int(thrid), "x") if thrid.isdigit() else None
+    labels = [lab.strip() for lab in raw_header(raw, "X-Gmail-Labels").split(",") if lab.strip()]
+    internal_date = 0
+    try:
+        if m:
+            dt = datetime.strptime(m.group(2).decode().strip(), "%a %b %d %H:%M:%S %z %Y")
+            internal_date = int(dt.timestamp() * 1000)
+    except ValueError:
+        pass
+    if not internal_date and headers.get("Date"):
+        try:
+            internal_date = int(email.utils.parsedate_to_datetime(headers["Date"]).timestamp() * 1000)
+        except (TypeError, ValueError):
+            pass
+    return gmail_id, thread_id, labels, max(internal_date, 0)
+
+
+def check_takeout_ids(files, known, sample_size=2000):
+    """Return (matching, checked) for the first `sample_size` messages that have an ID."""
+    matched = checked = 0
+    for _, stream, _, _ in takeout_sources(files):
+        for from_line, raw in iter_mbox(stream):
+            gmail_id, _, labels, _ = parse_takeout_message(from_line, raw)
+            if not gmail_id or SKIP_LABELS & {lab.lower() for lab in labels}:
+                continue
+            checked += 1
+            matched += gmail_id in known
+            if checked >= sample_size:
+                return matched, checked
+    return matched, checked
+
+
+def cmd_import(args):
+    db = open_db(args.db)
+    if not args.dry_run:
+        s3 = s3_client(args)
+        check_bucket(s3, args.bucket)
+
+    # Snapshot of what the state database already knows (one row per Gmail ID).
+    known = {r["id"]: (r["archived_at"] is not None, r["verify_error"] is not None,
+                       r["trashed_at"] is not None)
+             for r in db.execute("SELECT id, archived_at, verify_error, trashed_at FROM messages")}
+    listed = len(known)
+    stats = dict(messages=0, skipped_label=0, no_id=0, already=0, matched=0, new=0)
+    files = takeout_files(args.takeout)
+    sizes = [os.path.getsize(f) for f in files]
+    total_bytes = sum(sizes)
+    position = {"raw": None, "index": 0}
+
+    def bytes_done():
+        try:
+            current = position["raw"].tell() if position["raw"] else 0
+        except (OSError, ValueError):  # file already closed
+            current = 0
+        return sum(sizes[:position["index"]]) + current
+
+    def candidates():
+        """Parse the export and yield messages that still need archiving."""
+        for label, stream, raw_file, index in takeout_sources(files):
+            log.info("Reading %s", label)
+            position.update(raw=raw_file, index=index)
+            for from_line, raw in iter_mbox(stream):
+                stats["messages"] += 1
+                gmail_id, thread_id, labels, internal_date = parse_takeout_message(from_line, raw)
+                if SKIP_LABELS & {lab.lower() for lab in labels}:
+                    stats["skipped_label"] += 1
+                    continue
+                if not gmail_id:
+                    stats["no_id"] += 1
+                    continue
+                state = known.get(gmail_id)
+                if state is None:
+                    stats["new"] += 1
+                elif state[0] and not state[1] or state[2]:
+                    stats["already"] += 1  # archived (and not failed verify) or trashed
+                    continue
+                else:
+                    stats["matched"] += 1
+                if args.limit and stats["matched"] + stats["new"] > args.limit:
+                    return
+                yield gmail_id, raw, thread_id, labels, internal_date, bool(state and state[1])
+
+    if args.dry_run:
+        last_log = time.monotonic()
+        for _ in candidates():
+            if time.monotonic() - last_log >= 30:
+                last_log = time.monotonic()
+                log.info("Scanned %d messages (%.0f%% of the export)",
+                         stats["messages"], 100 * bytes_done() / max(total_bytes, 1))
+        seen = stats["already"] + stats["matched"] + stats["new"]
+        match = f"{(stats['already'] + stats['matched']) / seen:.1%}" if seen else "n/a"
+        print(
+            "\nTakeout dry run (nothing uploaded)\n"
+            f"  export size:             {human_bytes(total_bytes)}\n"
+            f"  messages in export:      {stats['messages']}\n"
+            f"  skipped spam/trash/chat: {stats['skipped_label']}\n"
+            f"  without a Gmail ID:      {stats['no_id']}\n"
+            f"  already archived:        {stats['already']}\n"
+            f"  to import, listed:       {stats['matched']}\n"
+            f"  to import, not listed:   {stats['new']} (newer than the listing, or unmatched)\n"
+            f"  match rate:              {match} of messages match the state database"
+        )
+        return
+
+    # Safety check before anything is uploaded: Takeout IDs must match the API listing,
+    # or cleanup (which trashes by ID) and the API workflow wouldn't line up with it.
+    if listed and not args.allow_unmatched:
+        matched, sample = check_takeout_ids(files, known)
+        if sample and matched / sample < 0.9:
+            sys.exit(
+                f"Only {matched / sample:.0%} of the first {sample} Takeout messages match the "
+                "Gmail IDs in the state database, so nothing was uploaded. Check that --db is "
+                "the current state database (use --sync-state), or pass --allow-unmatched."
+            )
+        log.info("ID check: %d of the first %d Takeout messages match the state database",
+                 matched, sample)
+
+    dedupe = DedupeIndex(db, by_message_id=not args.no_dedupe_message_id)
+    counts = {"uploaded": 0, "in_s3": 0, "duplicate": 0}
+    failed = 0
+    start = last_log = time.monotonic()
+    def store(item):
+        gmail_id, raw, thread_id, labels, internal_date, force = item
+        return store_message(args, s3, dedupe, gmail_id, raw, thread_id, internal_date,
+                             labels, force)
+
+    results = run_parallel(store, candidates(), args.workers, deadline_for(args))
+    try:
+        for i, (item, r, err) in enumerate(results, 1):
+            gmail_id = item[0]
+            if err is None:
+                db.execute("INSERT OR IGNORE INTO messages (id) VALUES (?)", (gmail_id,))
+                record_stored(db, gmail_id, r, "takeout")
+                counts[r["outcome"]] += 1
+            else:
+                failed += 1
+                log.error("Failed %s: %s: %s", gmail_id, type(err).__name__, err)
+            if i % 200 == 0:
+                db.commit()
+            t = time.monotonic()
+            if t - last_log >= 30:
+                last_log = t
+                done, read = sum(counts.values()), bytes_done()
+                eta = (t - start) * (total_bytes - read) / read if read else 0
+                log.info("Import: %.0f%% of export read, %d stored (%d uploaded, %d duplicates), "
+                         "%d already archived, %d failed, %.1f msg/s, ETA %dh%02dm",
+                         100 * read / max(total_bytes, 1), done, counts["uploaded"],
+                         counts["duplicate"], stats["already"], failed, done / (t - start),
+                         eta // 3600, eta % 3600 // 60)
+    finally:
+        results.close()  # stop the worker pool
+        db.commit()
+
+    log.info(
+        "Import finished: %d uploaded, %d already in S3, %d duplicates skipped, %d failed; "
+        "%d already archived, %d spam/trash/chat skipped, %d without a Gmail ID",
+        counts["uploaded"], counts["in_s3"], counts["duplicate"], failed,
+        stats["already"], stats["skipped_label"], stats["no_id"],
     )
     print_summary(db)
 
@@ -700,6 +1020,7 @@ def cmd_cleanup(args):
             sys.exit("Confirmation did not match; aborting.")
 
     gmail = ThreadLocalGmail(gmail_credentials(args.credentials, SCOPE_MODIFY, TOKEN_MODIFY))
+    configure_gmail_rate(db, args)
 
     def trash(msg_id):
         gmail_call(gmail.get().users().messages().trash(userId="me", id=msg_id))
@@ -726,6 +1047,7 @@ def cmd_cleanup(args):
     finally:
         results.close()  # stop the worker pool
         db.commit()
+        save_gmail_rate(db)
 
     log.info("Cleanup finished: %d trashed, %d already gone from Gmail, %d failed",
              done, gone, failed)
@@ -811,6 +1133,7 @@ def print_summary(db):
         f"  listed:         {q('SELECT COUNT(*) FROM messages')}\n"
         f"  archived:       {q('SELECT COUNT(*) FROM messages WHERE archived_at IS NOT NULL')}\n"
         f"    duplicates:   {q('SELECT COUNT(*) FROM messages WHERE duplicate_of IS NOT NULL')}\n"
+        f"    from Takeout: {q("SELECT COUNT(*) FROM messages WHERE source = 'takeout'")}\n"
         f"  archive errors: {q('SELECT COUNT(*) FROM messages WHERE archived_at IS NULL AND error IS NOT NULL')}\n"
         f"  verified:       {q('SELECT COUNT(*) FROM messages WHERE verified_at IS NOT NULL')}\n"
         f"  verify errors:  {q('SELECT COUNT(*) FROM messages WHERE verify_error IS NOT NULL')}\n"
@@ -840,8 +1163,8 @@ def cmd_status(args):
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mode", required=True, choices=["archive", "verify", "cleanup", "status", "login"])
-    p.add_argument("--bucket", help="S3 bucket name (required for archive/verify)")
+    p.add_argument("--mode", required=True, choices=["archive", "verify", "cleanup", "status", "login", "import"])
+    p.add_argument("--bucket", help="S3 bucket name (required for archive, verify and import)")
     p.add_argument("--region", default=None, help="AWS region, e.g. us-east-1")
     p.add_argument("--profile", default=None, help="AWS CLI profile name")
     p.add_argument("--prefix", default="gmail", help="S3 key prefix (default: gmail)")
@@ -854,15 +1177,23 @@ def parse_args(argv=None):
     p.add_argument("--workers", type=int, default=8,
                    help="Parallel Gmail/S3 requests for archive/verify/cleanup (default 8). Gmail allows "
                         "roughly 50 message downloads per second per user.")
-    p.add_argument("--rate", type=float, default=40,
-                   help="Max Gmail requests per second across all workers (default 40). "
-                        "Gmail's per-user quota allows about 50.")
+    p.add_argument("--rate", type=float, default=20,
+                   help="Max Gmail requests per second across all workers (default 20). "
+                        "The script lowers it automatically to fit your Gmail quota and "
+                        "remembers the rate that worked for the next run.")
     p.add_argument("--storage-class", default=None,
                    help="S3 storage class, e.g. STANDARD_IA, GLACIER_IR, DEEP_ARCHIVE")
     p.add_argument("--kms-key-id", default=None, help="Use SSE-KMS with this key (default SSE-S3)")
     p.add_argument("--no-dedupe-message-id", action="store_true",
                    help="archive: only treat byte-identical messages as duplicates, not "
                         "messages that share a Message-ID header")
+    p.add_argument("--takeout", nargs="+", metavar="PATH",
+                   help="import: Takeout .mbox files, .zip/.tgz archives or folders")
+    p.add_argument("--allow-unmatched", action="store_true",
+                   help="import: continue even if Takeout IDs don't match the state database")
+    p.add_argument("--sync-state", action="store_true",
+                   help="download the state database from s3://BUCKET/state/ before the run "
+                        "and upload it afterwards (keeps local runs in step with the workflows)")
     p.add_argument("--relist", action="store_true",
                    help="archive: list every message again instead of only new mail")
     p.add_argument("--reverify", action="store_true", help="verify: re-check already verified objects")
@@ -871,13 +1202,20 @@ def parse_args(argv=None):
                    help="cleanup: skip the typed confirmation (for automation; needs --confirm)")
     p.add_argument("--max-runtime", type=int, default=0,
                    help="archive/verify/cleanup: stop cleanly after N minutes (resume later)")
-    p.add_argument("--dry-run", action="store_true", help="cleanup: show what would be trashed")
+    p.add_argument("--dry-run", action="store_true",
+                   help="cleanup: show what would be trashed; import: report what would be imported")
     p.add_argument("--allow-partial", action="store_true",
                    help="cleanup: proceed even if some archived messages are unverified")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
     if args.mode in ("archive", "verify") and not args.bucket:
         p.error("--bucket is required for archive and verify modes")
+    if args.mode == "import" and not args.takeout:
+        p.error("--takeout is required for import mode")
+    if args.mode == "import" and not args.dry_run and not args.bucket:
+        p.error("--bucket is required for import (except with --dry-run)")
+    if args.sync_state and not args.bucket:
+        p.error("--sync-state requires --bucket")
     if args.yes and not args.confirm:
         p.error("--yes requires --confirm")
     if not 0 < args.rate <= 50:
@@ -887,6 +1225,38 @@ def parse_args(argv=None):
     if args.limit < 0 or args.max_runtime < 0:
         p.error("--limit and --max-runtime must be 0 or more")
     return args
+
+
+STATE_KEY = "state/archive_state.sqlite3"
+
+
+def sync_state_down(args):
+    """Download the shared state database from S3, keeping a backup of the local copy."""
+    s3 = s3_client(args)
+    try:
+        s3.head_object(Bucket=args.bucket, Key=STATE_KEY)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
+            log.warning("No state database at s3://%s/%s yet; using the local one.",
+                        args.bucket, STATE_KEY)
+            return
+        sys.exit(f"Cannot read s3://{args.bucket}/{STATE_KEY}: {e}")
+    if os.path.exists(args.db):
+        os.replace(args.db, args.db + ".bak")
+        log.info("Backed up local state database to %s.bak", args.db)
+    s3.download_file(args.bucket, STATE_KEY, args.db)
+    log.info("Downloaded state database from s3://%s/%s", args.bucket, STATE_KEY)
+
+
+def sync_state_up(args):
+    if not os.path.exists(args.db):
+        return
+    check = sqlite3.connect(args.db).execute("PRAGMA integrity_check").fetchone()[0]
+    if check != "ok":
+        log.error("State database failed its integrity check (%s); not uploading.", check)
+        return
+    s3_client(args).upload_file(args.db, args.bucket, STATE_KEY)
+    log.info("Uploaded state database to s3://%s/%s", args.bucket, STATE_KEY)
 
 
 def _raise_interrupt(signum, frame):
@@ -901,17 +1271,23 @@ def main(argv=None):
     )
     # The Gmail client logs every rate-limit response itself; gmail_call reports them.
     logging.getLogger("googleapiclient.http").setLevel(logging.ERROR)
-    global gmail_limiter
-    gmail_limiter = GmailRateLimiter(args.rate)
+
     # GitHub Actions cancels and timeouts send SIGTERM; handle it like Ctrl+C so
     # progress is committed before exiting.
     signal.signal(signal.SIGTERM, _raise_interrupt)
+    modifies_state = args.mode in ("archive", "verify", "cleanup", "import") and not args.dry_run
+    if args.sync_state:
+        sync_state_down(args)
     try:
-        {"archive": cmd_archive, "verify": cmd_verify,
-         "cleanup": cmd_cleanup, "status": cmd_status, "login": cmd_login}[args.mode](args)
+        {"archive": cmd_archive, "verify": cmd_verify, "cleanup": cmd_cleanup,
+         "status": cmd_status, "login": cmd_login, "import": cmd_import}[args.mode](args)
     except KeyboardInterrupt:
         log.warning("Interrupted; progress so far is saved. Run the same command to continue.")
         sys.exit(130)
+    finally:
+        # Runs after errors and interrupts too, so the shared copy keeps all progress.
+        if args.sync_state and modifies_state:
+            sync_state_up(args)
 
 
 if __name__ == "__main__":

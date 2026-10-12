@@ -15,7 +15,7 @@ on:
         required: false
         default: "0"
       workers:
-        description: "Parallel requests (Gmail allows ~50 downloads/s per user)"
+        description: "Parallel requests (speed is limited by the Gmail quota, ~1.5 messages/s by default)"
         required: false
         default: "8"
       storage_class:
