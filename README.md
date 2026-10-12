@@ -195,7 +195,12 @@ caffeinate -i python archive.py --mode archive --bucket YOUR_BUCKET --region us-
 ```
 
 The first run lists every message ID, which takes a few minutes for a large
-mailbox. Later runs skip the listing and continue with what is left.
+mailbox. Later runs only look for new mail, newest first, and stop at the first page
+with nothing new. If you import old mail into Gmail, run once with `--relist`:
+Gmail lists imported mail by its original date, so the quick check can miss it.
+
+You can stop a run at any time with Ctrl+C. GitHub cancels and timeouts are also
+handled. Progress is saved, and the next run continues where this one stopped.
 
 Choose your storage class before the full run. `--storage-class` only applies to
 new uploads.
@@ -281,6 +286,7 @@ python archive.py --mode status
 | `--workers` | 8 | Parallel requests for `archive`, `verify` and `cleanup`. Gmail allows roughly 50 message requests per second per user. |
 | `--storage-class` | `STANDARD` | e.g. `STANDARD_IA`, `GLACIER_IR`, `INTELLIGENT_TIERING`, `DEEP_ARCHIVE` |
 | `--kms-key-id` | (SSE-S3) | Encrypt with SSE-KMS using this key |
+| `--relist` | off | `archive`: list every message again instead of only new mail |
 | `--no-dedupe-message-id` | off | `archive`: only treat byte-identical messages as duplicates, not messages sharing a `Message-ID` |
 | `--reverify` | off | `verify`: re-check objects that already passed |
 | `--dry-run` | off | `cleanup`: show the count only, change nothing |
@@ -311,8 +317,10 @@ Storage class notes:
 
 - **Never commit secrets.** `credentials.json`, `token_*.json` and the database are
   excluded by `.gitignore`.
-- **Rate limits.** Gmail API rate-limit and 5xx errors are retried with exponential
-  backoff. If you see many rate-limit warnings, lower `--workers`.
+- **Rate limits and network errors.** Gmail rate limits, 5xx errors, timeouts and
+  dropped connections are retried with exponential backoff, for about a minute
+  before a message is marked failed. S3 requests use the AWS SDK's adaptive
+  retries. If you see many rate-limit warnings, lower `--workers`.
 - **Large mailboxes take hours.** Runs can be stopped and resumed at any time.
   Progress is saved every 100 messages.
 
@@ -321,7 +329,7 @@ Storage class notes:
 | Situation | What to do |
 | --- | --- |
 | Script interrupted | Re-run the same command. Completed messages are skipped. |
-| Some messages failed to archive | Check `status`, then re-run `archive`. Messages deleted from Gmail after listing are recorded as `not found in Gmail`. |
+| Some messages failed to archive | Check `status`, then re-run `archive`. Messages deleted from Gmail after listing are recorded as `not found in Gmail` and are not retried. |
 | Verification failures | Fix the cause, then re-run `archive`. Messages that failed verification are re-uploaded. Then run `verify` again. |
 | Revoke OAuth access | Delete `token_*.json` and remove the app at <https://myaccount.google.com/permissions>. |
 | Restore a message to Gmail | Within 30 days, move it out of Trash in Gmail. After that, import the `.eml` from S3 using a mail client. |
