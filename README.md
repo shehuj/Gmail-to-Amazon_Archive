@@ -274,6 +274,27 @@ Before emptying Trash yourself, check two things:
 python archive.py --mode status
 ```
 
+The summary ends with an estimated AWS cost:
+
+```text
+Estimated AWS cost (S3 list prices, us-east-1)
+  storage:        $0.31 per month
+  requests:       $1.57 so far (270000 uploads, 540000 reads)
+  total so far:   $1.88 (requests + one month of storage)
+```
+
+How the estimate is calculated:
+
+- **Storage:** the bytes stored in S3, priced by the storage class each message was
+  uploaded with. It includes the 128 KB minimum object size for `STANDARD_IA` and
+  `GLACIER_IR`.
+- **Requests:** uploads, plus the "already in S3" checks and verify downloads.
+- **Not included:** data transfer (the first 100 GB a month is free), KMS, and old
+  object versions.
+
+Prices are hard-coded us-east-1 list prices in `S3_PRICES` in `archive.py`.
+Check your AWS bill for actual charges.
+
 ## Options
 
 | Option | Default | Description |
@@ -287,6 +308,7 @@ python archive.py --mode status
 | `--credentials` | `credentials.json` | Google OAuth client file |
 | `--query` | (all mail) | Gmail search query. Spam and Trash are always excluded. |
 | `--limit` | 0 (no limit) | Process at most N messages in this run |
+| `--rate` | 40 | Maximum Gmail requests per second, shared by all workers. Gmail's per-user quota allows about 50. |
 | `--workers` | 8 | Parallel requests for `archive`, `verify` and `cleanup`. Gmail allows roughly 50 message requests per second per user. |
 | `--storage-class` | `STANDARD` | e.g. `STANDARD_IA`, `GLACIER_IR`, `INTELLIGENT_TIERING`, `DEEP_ARCHIVE` |
 | `--kms-key-id` | (SSE-S3) | Encrypt with SSE-KMS using this key |
@@ -321,10 +343,15 @@ Storage class notes:
 
 - **Never commit secrets.** `credentials.json`, `token_*.json` and the database are
   excluded by `.gitignore`.
-- **Rate limits and network errors.** Gmail rate limits, 5xx errors, timeouts and
-  dropped connections are retried with exponential backoff, for about a minute
-  before a message is marked failed. S3 requests use the AWS SDK's adaptive
-  retries. If you see many rate-limit warnings, lower `--workers`.
+- **Gmail quota.** Gmail allows each user about 50 message requests per second.
+  All workers share one rate limit (`--rate`, default 40 per second), so adding
+  workers never exceeds the quota.
+  - If Gmail still reports `Quota exceeded` or `rateLimitExceeded`, every worker
+    pauses together for 10–60 seconds. The rate then drops by 20% and recovers
+    gradually.
+  - A message is only marked failed after 12 quota errors.
+- **Network errors.** 5xx errors, timeouts and dropped connections are retried with
+  exponential backoff. S3 requests use the AWS SDK's adaptive retries.
 - **Large mailboxes take hours.** Runs can be stopped and resumed at any time.
   Progress is saved every 100 messages.
 
@@ -349,7 +376,7 @@ Storage class notes:
 | `Error 403: access_denied` ("can only be accessed by developer-approved testers") | Your Gmail address isn't a test user. Add it under **Google Auth Platform → Audience → Test users**, in the project that owns `credentials.json`. |
 | `Gmail token ... could not be refreshed` / `invalid_grant` | The token expired (7 days in Testing mode) or access was revoked. Run `python archive.py --mode login`. Update the GitHub secrets if you use the workflows. |
 | `Cannot access bucket` | Check the bucket name, the `--region`, and your AWS credentials (`aws sts get-caller-identity`). |
-| Many `Gmail API 429` warnings | You are hitting Gmail's rate limit. Lower `--workers`. |
+| Many `Gmail quota reached; pausing all workers` warnings | Expected once or twice per run. If they keep repeating, lower `--rate`, e.g. `--rate 30`. |
 | `No valid Gmail token ... no browser is available in CI` | The `GMAIL_TOKEN_READONLY` or `GMAIL_TOKEN_MODIFY` secret is missing or invalid. |
 
 ## GitHub Actions
