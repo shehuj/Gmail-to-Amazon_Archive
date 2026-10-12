@@ -38,6 +38,30 @@ for the Gmail message ID, thread ID, internal date, labels and SHA-256.
 Progress is tracked in a local SQLite database (`archive_state.sqlite3`), so you can
 interrupt any stage and re-run it to resume where it stopped.
 
+### Duplicates
+
+`archive` skips duplicates, so each email is stored in S3 only once:
+
+| Duplicate | How it's detected | What happens |
+| --- | --- | --- |
+| Already archived | Same Gmail message ID in the state database | Skipped without downloading |
+| Identical copy | Another Gmail message with the same SHA-256 (byte-for-byte identical) | Not uploaded |
+| Same email, different copy | Another Gmail message with the same `Message-ID` header. Copies from imports, forwards or mailing lists can differ slightly in headers such as `Received`. | Not uploaded. Use `--no-dedupe-message-id` to turn this check off. |
+| Already in S3 | An object at the same key with the same SHA-256, e.g. after the state database was lost | Not uploaded again. This also avoids extra versions in a versioned bucket. |
+
+How duplicates are handled after archiving:
+
+- **Recorded, not uploaded.** A duplicate is recorded in the state database with
+  `duplicate_of` set to the original message and points to the original's S3 object.
+- **Verified with the original.** `verify` checks only the originals. Each duplicate
+  is marked verified when its original is.
+- **Trashed by cleanup.** `cleanup` moves duplicates to Trash too, because their
+  content is already archived.
+- **Re-queued if the original fails.** If the original's upload fails, its
+  duplicates go back in the queue and are archived on the next run.
+- **Corrupted objects are always replaced.** A message whose S3 object failed
+  verification is always re-uploaded, even though an object exists at its key.
+
 ## Files
 
 | File | Purpose |
@@ -46,7 +70,7 @@ interrupt any stage and re-run it to resume where it stopped.
 | `requirements.txt` | Python dependencies |
 | `.github/workflows/ingest.yml` | Manually triggered GitHub Actions workflow: archive + verify |
 | `.github/workflows/cleanup.yml` | Manually triggered GitHub Actions workflow: move verified mail to Trash |
-| `aws/` | IAM trust and permissions policies for the GitHub Actions role |
+| `aws/` | IAM trust and permissions policies for the GitHub Actions role, and the S3 lifecycle rule |
 | `.gitignore` | Keeps credentials, OAuth tokens and local state out of git |
 
 ## Setup
@@ -116,6 +140,29 @@ aws s3api put-bucket-encryption --bucket "$BUCKET" \
   --server-side-encryption-configuration \
   '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
 ```
+
+Add a lifecycle rule so overwritten versions don't keep costing money:
+
+```bash
+aws s3api put-bucket-lifecycle-configuration --bucket "$BUCKET" \
+  --lifecycle-configuration file://aws/s3-lifecycle.json
+```
+
+The rule in `aws/s3-lifecycle.json` applies to the whole bucket:
+
+- **Old versions** are deleted 30 days after they are overwritten or deleted. This
+  includes old copies of the state database, which is re-uploaded on every
+  workflow run.
+- **Leftover delete markers** are removed automatically.
+- **Unfinished multipart uploads** are cleaned up after 7 days. Large uploads, such
+  as `aws s3 cp` of the state database, use multipart.
+
+Current objects are never deleted. The trade-off is that an object overwritten or
+deleted by mistake can only be recovered within those 30 days.
+
+Note that `put-bucket-lifecycle-configuration` **replaces** any lifecycle rules the
+bucket already has. Check first with
+`aws s3api get-bucket-lifecycle-configuration --bucket "$BUCKET"`.
 
 The IAM identity running the script needs these permissions on the bucket:
 
@@ -234,6 +281,7 @@ python archive.py --mode status
 | `--workers` | 8 | Parallel requests for `archive`, `verify` and `cleanup`. Gmail allows roughly 50 message requests per second per user. |
 | `--storage-class` | `STANDARD` | e.g. `STANDARD_IA`, `GLACIER_IR`, `INTELLIGENT_TIERING`, `DEEP_ARCHIVE` |
 | `--kms-key-id` | (SSE-S3) | Encrypt with SSE-KMS using this key |
+| `--no-dedupe-message-id` | off | `archive`: only treat byte-identical messages as duplicates, not messages sharing a `Message-ID` |
 | `--reverify` | off | `verify`: re-check objects that already passed |
 | `--dry-run` | off | `cleanup`: show the count only, change nothing |
 | `--confirm` | off | `cleanup`: required to modify Gmail |

@@ -16,6 +16,7 @@ Progress is tracked in a local SQLite database so every mode is resumable.
 
 import argparse
 import base64
+import email.parser
 import hashlib
 import json
 import logging
@@ -63,7 +64,9 @@ CREATE TABLE IF NOT EXISTS messages (
     verified_at   TEXT,
     verify_error  TEXT,
     trashed_at    TEXT,
-    error         TEXT
+    error         TEXT,
+    message_id_header TEXT,
+    duplicate_of  TEXT
 );
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -80,6 +83,15 @@ def open_db(path):
     db = sqlite3.connect(path)
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
+    # Add columns introduced after the first release to existing databases.
+    columns = {r["name"] for r in db.execute("PRAGMA table_info(messages)")}
+    for column in ("message_id_header", "duplicate_of"):
+        if column not in columns:
+            db.execute(f"ALTER TABLE messages ADD COLUMN {column} TEXT")
+    db.executescript(
+        "CREATE INDEX IF NOT EXISTS idx_messages_sha256 ON messages(sha256);"
+        "CREATE INDEX IF NOT EXISTS idx_messages_duplicate_of ON messages(duplicate_of);"
+    )
     return db
 
 
@@ -273,36 +285,117 @@ def deadline_for(args):
     return time.monotonic() + args.max_runtime * 60 if args.max_runtime else None
 
 
-def archive_one(args, s3, gmail, msg_id):
-    """Download one message from Gmail and upload it to S3. Runs in a worker thread."""
+class DedupeIndex:
+    """Thread-safe index of archived content, used to skip duplicate messages.
+
+    A message is a duplicate if another Gmail message with the same SHA-256 (identical
+    raw content) or, unless disabled, the same Message-ID header was already archived.
+    """
+
+    def __init__(self, db, by_message_id):
+        self.by_message_id = by_message_id
+        self.lock = threading.Lock()
+        self.sha = {}
+        self.mid = {}
+        for r in db.execute(
+            "SELECT id, s3_key, sha256, message_id_header FROM messages "
+            "WHERE archived_at IS NOT NULL AND duplicate_of IS NULL"
+        ):
+            self.sha[r["sha256"]] = (r["id"], r["s3_key"])
+            if r["message_id_header"]:
+                self.mid[r["message_id_header"]] = (r["id"], r["s3_key"])
+
+    def claim(self, msg_id, digest, message_id, key):
+        """Return (original_id, original_key) if a duplicate, else register this message."""
+        with self.lock:
+            hit = self.sha.get(digest)
+            if not hit and self.by_message_id and message_id:
+                hit = self.mid.get(message_id)
+            if hit and hit[0] != msg_id:
+                return hit
+            self.sha[digest] = (msg_id, key)
+            if message_id:
+                self.mid[message_id] = (msg_id, key)
+            return None
+
+    def release(self, msg_id, digest, message_id):
+        """Forget a claim whose upload failed, so a later copy can be uploaded instead."""
+        with self.lock:
+            if self.sha.get(digest, (None,))[0] == msg_id:
+                del self.sha[digest]
+            if message_id and self.mid.get(message_id, (None,))[0] == msg_id:
+                del self.mid[message_id]
+
+
+def message_id_header(raw):
+    headers = email.parser.BytesHeaderParser().parsebytes(raw)
+    value = headers.get("Message-ID") or headers.get("Message-Id") or ""
+    return str(value).strip() or None
+
+
+def s3_has_object(s3, bucket, key, digest):
+    """True if `key` already exists in S3 with the same SHA-256 (e.g. from a previous run)."""
+    try:
+        head = s3.head_object(Bucket=bucket, Key=key)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise
+    return head.get("Metadata", {}).get("sha256") == digest
+
+
+def archive_one(args, s3, gmail, dedupe, msg_id, force_upload=False):
+    """Download one message from Gmail and upload it to S3. Runs in a worker thread.
+
+    Returns a dict whose "outcome" is "uploaded", "in_s3" (identical object already
+    there) or "duplicate" (same content as another archived message; not uploaded).
+    `force_upload` skips the "already in S3" check, for objects that failed verification.
+    """
     msg = gmail_call(gmail.get().users().messages().get(userId="me", id=msg_id, format="raw"))
     raw = base64.urlsafe_b64decode(msg["raw"])
     digest = hashlib.sha256(raw).hexdigest()
     internal_date = int(msg.get("internalDate", 0))
     key = s3_key_for(args.prefix, msg_id, internal_date)
+    message_id = message_id_header(raw)
+    result = dict(thread_id=msg.get("threadId"), internal_date=internal_date, key=key,
+                  sha256=digest, size=len(raw), message_id=message_id, duplicate_of=None)
 
-    put = dict(
-        Bucket=args.bucket,
-        Key=key,
-        Body=raw,
-        ContentType="message/rfc822",
-        ChecksumSHA256=base64.b64encode(bytes.fromhex(digest)).decode(),
-        Metadata={
-            "gmail-id": msg_id,
-            "gmail-thread-id": msg.get("threadId", ""),
-            "gmail-internal-date": str(internal_date),
-            "gmail-labels": ",".join(msg.get("labelIds", []))[:1500],
-            "sha256": digest,
-        },
-    )
-    if args.kms_key_id:
-        put.update(ServerSideEncryption="aws:kms", SSEKMSKeyId=args.kms_key_id)
-    else:
-        put.update(ServerSideEncryption="AES256")
-    if args.storage_class:
-        put["StorageClass"] = args.storage_class
-    s3.put_object(**put)
-    return msg.get("threadId"), internal_date, key, digest, len(raw)
+    original = dedupe.claim(msg_id, digest, message_id, key)
+    if original:
+        result.update(outcome="duplicate", duplicate_of=original[0], key=original[1])
+        return result
+
+    try:
+        if not force_upload and s3_has_object(s3, args.bucket, key, digest):
+            result["outcome"] = "in_s3"
+            return result
+
+        put = dict(
+            Bucket=args.bucket,
+            Key=key,
+            Body=raw,
+            ContentType="message/rfc822",
+            ChecksumSHA256=base64.b64encode(bytes.fromhex(digest)).decode(),
+            Metadata={
+                "gmail-id": msg_id,
+                "gmail-thread-id": msg.get("threadId", ""),
+                "gmail-internal-date": str(internal_date),
+                "gmail-labels": ",".join(msg.get("labelIds", []))[:1500],
+                "sha256": digest,
+            },
+        )
+        if args.kms_key_id:
+            put.update(ServerSideEncryption="aws:kms", SSEKMSKeyId=args.kms_key_id)
+        else:
+            put.update(ServerSideEncryption="AES256")
+        if args.storage_class:
+            put["StorageClass"] = args.storage_class
+        s3.put_object(**put)
+    except Exception:
+        dedupe.release(msg_id, digest, message_id)
+        raise
+    result["outcome"] = "uploaded"
+    return result
 
 
 def cmd_archive(args):
@@ -314,28 +407,36 @@ def cmd_archive(args):
     list_messages(build("gmail", "v1", credentials=creds, cache_discovery=False), db, args.query)
 
     sql = (
-        "SELECT id FROM messages WHERE (archived_at IS NULL OR verify_error IS NOT NULL) "
+        "SELECT id, verify_error FROM messages WHERE (archived_at IS NULL OR verify_error IS NOT NULL) "
         "AND trashed_at IS NULL ORDER BY id"
     )
     if args.limit:
         sql += f" LIMIT {int(args.limit)}"
-    pending = [r["id"] for r in db.execute(sql)]
+    rows = db.execute(sql).fetchall()
+    pending = [r["id"] for r in rows]
+    # The S3 copy of these failed verification, so it must be replaced even though it exists.
+    reupload = {r["id"] for r in rows if r["verify_error"]}
     log.info("%d messages to archive with %d workers", len(pending), args.workers)
 
     gmail = ThreadLocalGmail(creds)
+    dedupe = DedupeIndex(db, by_message_id=not args.no_dedupe_message_id)
     progress = Progress(len(pending), "Archive")
-    done = failed = 0
-    results = run_parallel(lambda m: archive_one(args, s3, gmail, m), pending, args.workers,
-                           deadline_for(args))
-    for i, (msg_id, result, err) in enumerate(results, 1):
+    counts = {"uploaded": 0, "in_s3": 0, "duplicate": 0}
+    failed = 0
+    results = run_parallel(lambda m: archive_one(args, s3, gmail, dedupe, m, m in reupload), pending,
+                           args.workers, deadline_for(args))
+    for i, (msg_id, r, err) in enumerate(results, 1):
         if err is None:
-            thread_id, internal_date, key, digest, size = result
             db.execute(
                 "UPDATE messages SET thread_id=?, internal_date=?, s3_key=?, sha256=?, size=?, "
-                "archived_at=?, error=NULL, verified_at=NULL, verify_error=NULL WHERE id=?",
-                (thread_id, internal_date, key, digest, size, now(), msg_id),
+                "message_id_header=?, duplicate_of=?, archived_at=?, error=NULL, "
+                "verified_at=NULL, verify_error=NULL WHERE id=?",
+                (r["thread_id"], r["internal_date"], r["key"], r["sha256"], r["size"],
+                 r["message_id"], r["duplicate_of"], now(), msg_id),
             )
-            done += 1
+            counts[r["outcome"]] += 1
+            if r["outcome"] == "duplicate":
+                log.debug("Duplicate %s of %s; not uploaded", msg_id, r["duplicate_of"])
         else:
             if isinstance(err, HttpError) and err.resp.status == 404:
                 # Deleted from Gmail since listing; nothing to archive.
@@ -350,7 +451,21 @@ def cmd_archive(args):
             progress.log(i, failed)
     db.commit()
 
-    log.info("Archive finished: %d archived, %d failed", done, failed)
+    # A duplicate is only safe while its original is archived. If the original's upload
+    # failed, put the duplicate back in the queue so the next run archives it instead.
+    orphans = db.execute(
+        "UPDATE messages SET archived_at=NULL, duplicate_of=NULL, s3_key=NULL, verified_at=NULL "
+        "WHERE trashed_at IS NULL AND duplicate_of IN "
+        "(SELECT id FROM messages WHERE archived_at IS NULL)"
+    ).rowcount
+    db.commit()
+    if orphans:
+        log.warning("%d duplicates re-queued because their original failed to archive", orphans)
+
+    log.info(
+        "Archive finished: %d uploaded, %d already in S3, %d duplicates skipped, %d failed",
+        counts["uploaded"], counts["in_s3"], counts["duplicate"], failed,
+    )
     print_summary(db)
 
 
@@ -363,7 +478,10 @@ def cmd_verify(args):
     s3 = s3_client(args)
     check_bucket(s3, args.bucket)
 
-    sql = "SELECT id, s3_key, sha256, size FROM messages WHERE archived_at IS NOT NULL"
+    sql = (
+        "SELECT id, s3_key, sha256, size FROM messages "
+        "WHERE archived_at IS NOT NULL AND duplicate_of IS NULL"
+    )
     if not args.reverify:
         sql += " AND verified_at IS NULL"
     rows = db.execute(sql).fetchall()
@@ -402,6 +520,14 @@ def cmd_verify(args):
         if i % 100 == 0:
             db.commit()
             progress.log(i, bad)
+    db.commit()
+
+    # Duplicates were not uploaded; they are verified when their original is.
+    db.execute(
+        "UPDATE messages SET verified_at = "
+        "(SELECT o.verified_at FROM messages o WHERE o.id = messages.duplicate_of) "
+        "WHERE duplicate_of IS NOT NULL AND archived_at IS NOT NULL"
+    )
     db.commit()
 
     log.info("Verify finished: %d OK, %d failed", ok, bad)
@@ -483,11 +609,12 @@ def print_summary(db):
         "\nState summary\n"
         f"  listed:         {q('SELECT COUNT(*) FROM messages')}\n"
         f"  archived:       {q('SELECT COUNT(*) FROM messages WHERE archived_at IS NOT NULL')}\n"
+        f"    duplicates:   {q('SELECT COUNT(*) FROM messages WHERE duplicate_of IS NOT NULL')}\n"
         f"  archive errors: {q('SELECT COUNT(*) FROM messages WHERE archived_at IS NULL AND error IS NOT NULL')}\n"
         f"  verified:       {q('SELECT COUNT(*) FROM messages WHERE verified_at IS NOT NULL')}\n"
         f"  verify errors:  {q('SELECT COUNT(*) FROM messages WHERE verify_error IS NOT NULL')}\n"
         f"  trashed:        {q('SELECT COUNT(*) FROM messages WHERE trashed_at IS NOT NULL')}\n"
-        f"  archived bytes: {q('SELECT COALESCE(SUM(size), 0) FROM messages WHERE archived_at IS NOT NULL')}"
+        f"  bytes in S3:    {q('SELECT COALESCE(SUM(size), 0) FROM messages WHERE archived_at IS NOT NULL AND duplicate_of IS NULL')}"
     )
 
 
@@ -525,6 +652,9 @@ def parse_args(argv=None):
     p.add_argument("--storage-class", default=None,
                    help="S3 storage class, e.g. STANDARD_IA, GLACIER_IR, DEEP_ARCHIVE")
     p.add_argument("--kms-key-id", default=None, help="Use SSE-KMS with this key (default SSE-S3)")
+    p.add_argument("--no-dedupe-message-id", action="store_true",
+                   help="archive: only treat byte-identical messages as duplicates, not "
+                        "messages that share a Message-ID header")
     p.add_argument("--reverify", action="store_true", help="verify: re-check already verified objects")
     p.add_argument("--confirm", action="store_true", help="cleanup: required to modify Gmail")
     p.add_argument("--yes", action="store_true",
