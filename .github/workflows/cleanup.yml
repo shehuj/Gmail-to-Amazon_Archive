@@ -44,8 +44,10 @@ jobs:
     # required reviewers to it, so only approved cleanup runs can modify the mailbox.
     environment: mailbox-cleanup
     env:
-      AWS_REGION: ${{ vars.AWS_REGION }}
-      STATE_URI: s3://${{ vars.S3_BUCKET }}/state/archive_state.sqlite3
+      # Each setting can be a repository variable or a secret.
+      AWS_REGION: ${{ vars.AWS_REGION || secrets.AWS_REGION }}
+      STATE_URI: s3://${{ vars.S3_BUCKET || secrets.S3_BUCKET }}/state/archive_state.sqlite3
+      USE_OIDC_ROLE: ${{ secrets.AWS_ROLE_ARN != '' }}
     steps:
       - name: Check confirmation
         env:
@@ -57,6 +59,27 @@ jobs:
             exit 1
           fi
 
+      - name: Check configuration
+        env:
+          S3_BUCKET: ${{ vars.S3_BUCKET || secrets.S3_BUCKET }}
+          HAS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
+          HAS_SECRET_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY != '' }}
+          HAS_GMAIL_TOKEN: ${{ secrets.GMAIL_TOKEN_MODIFY != '' }}
+          NEED_GMAIL_TOKEN: ${{ !inputs.dry_run }}
+        run: |
+          missing=()
+          [ -n "$AWS_REGION" ] || missing+=("AWS_REGION (repository variable or secret, e.g. us-east-1)")
+          [ -n "$S3_BUCKET" ] || missing+=("S3_BUCKET (repository variable or secret, e.g. gmailstore)")
+          if [ "$USE_OIDC_ROLE" != "true" ] && { [ "$HAS_KEY_ID" != "true" ] || [ "$HAS_SECRET_KEY" != "true" ]; }; then
+            missing+=("AWS_ROLE_ARN secret, or both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY secrets")
+          fi
+          if [ "$NEED_GMAIL_TOKEN" = "true" ] && [ "$HAS_GMAIL_TOKEN" != "true" ]; then
+            missing+=("GMAIL_TOKEN_MODIFY secret (contents of token_modify.json from 'python archive.py --mode login')")
+          fi
+          for m in "${missing[@]}"; do echo "::error::Missing $m"; done
+          [ ${#missing[@]} -eq 0 ] || exit 1
+          if [ "$USE_OIDC_ROLE" = "true" ]; then echo "AWS auth: OIDC role"; else echo "AWS auth: access keys"; fi
+
       - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v7
@@ -67,12 +90,21 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (OIDC role)
+        if: env.USE_OIDC_ROLE == 'true'
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
           role-duration-seconds: 21600
+
+      - name: Configure AWS credentials (access keys)
+        if: env.USE_OIDC_ROLE != 'true'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Download state database
         id: state

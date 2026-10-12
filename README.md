@@ -8,9 +8,10 @@ Python · Gmail API · Boto3 · SQLite · AWS S3
 > **Status:**
 >
 > - **Tested with real Gmail and S3:** a small `archive` run.
-> - **Tested offline only** (fake Gmail and S3): parallel workers, `verify`,
->   `cleanup`, `--max-runtime`, and the GitHub Actions workflows, which also pass
->   `actionlint`.
+> - **Tested offline only** (fake Gmail and S3): parallel workers, duplicate
+>   handling, `verify`, `cleanup`, `--max-runtime` and interrupt handling.
+> - **GitHub Actions workflows:** pass `actionlint`, and the configuration check was
+>   tested locally. They have not yet completed a run on GitHub.
 >
 > Start each new stage with a small `--limit` run.
 
@@ -355,27 +356,42 @@ Two workflows run the tool from GitHub. Both are triggered manually from the
 
 | Workflow | Gmail access | What it does |
 | --- | --- | --- |
-| **Ingest Gmail to S3** (`ingest.yml`) | read-only | Runs `archive`, then `verify`. Inputs: `query`, `limit`, `workers`, `storage_class`, `max_runtime`, `run_verify`. |
-| **Clean up Gmail mailbox** (`cleanup.yml`) | modify | Runs `cleanup`. Defaults to a dry run. A real run needs `dry_run` unchecked and `confirm` set to `TRASH`. |
+| **Ingest Gmail to S3** (`ingest.yml`) | read-only | Runs `archive`, then `verify`. Each run picks up mail that arrived since the last run. Inputs: `query`, `limit`, `workers`, `storage_class`, `max_runtime`, `run_verify`. |
+| **Clean up Gmail mailbox** (`cleanup.yml`) | modify | Runs `cleanup`. Defaults to a dry run. A real run needs `dry_run` unchecked and `confirm` set to exactly `TRASH`. |
 
 How the workflows behave:
 
+- **Configuration is checked first.** The **Check configuration** step lists every
+  missing setting before anything else runs.
 - **State is shared through S3.** Each run downloads
   `s3://YOUR_BUCKET/state/archive_state.sqlite3`, works on it, and uploads it
-  again, even if the run fails part-way. Bucket versioning keeps older copies.
+  again, even if the run fails part-way. If the download fails, the upload is
+  skipped, so a blank database never overwrites real progress. Bucket versioning
+  keeps older copies.
 - **Runs never overlap.** Both workflows share one concurrency group, so a second
   run waits for the first to finish.
-- **Long jobs stop cleanly.** GitHub-hosted jobs are limited to 6 hours, so each run
-  stops after `max_runtime` minutes and saves its progress. Run the workflow again
-  to continue. For the first full migration of a large mailbox, running from your
-  Mac is simpler.
-- **AWS access uses OIDC.** GitHub signs in to an IAM role with short-lived
-  credentials. No AWS keys are stored in GitHub.
+- **Long jobs stop cleanly.** GitHub-hosted jobs are limited to 6 hours. Each run
+  stops after `max_runtime` minutes and saves its progress. A cancelled run also
+  saves its progress. Run the workflow again to continue. For the first full
+  migration of a large mailbox, running from your Mac is simpler.
 
-### 1. Keep Google sign-ins from expiring
+### Required settings
+
+Add these under **Settings → Secrets and variables → Actions**:
+
+| Setting | Type | Needed by | Value |
+| --- | --- | --- | --- |
+| `AWS_REGION` | variable or secret | both | Bucket region, e.g. `us-east-1` |
+| `S3_BUCKET` | variable or secret | both | Bucket name, e.g. `gmailstore` |
+| `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` | secrets | both | IAM user access keys (option A below) |
+| `AWS_ROLE_ARN` | secret | both | IAM role for OIDC (option B below). If set, it is used instead of access keys. |
+| `GMAIL_TOKEN_READONLY` | secret | ingest | Contents of `token_readonly.json` |
+| `GMAIL_TOKEN_MODIFY` | secret | cleanup (real runs) | Contents of `token_modify.json`. Can be a repository secret or a `mailbox-cleanup` environment secret. |
+
+### 1. Create the Gmail tokens
 
 While the OAuth app is in **Testing** mode, Google expires its tokens after 7 days.
-That would break the workflows.
+That would break the workflows. Publish the app first:
 
 1. Open the consent screen settings. In newer consoles, go to **Google Auth Platform → Audience**.
 2. Click **Publish app** and set the status to **In production**.
@@ -383,15 +399,40 @@ That would break the workflows.
 For personal use you don't need Google's verification. You'll still see the
 "Google hasn't verified this app" warning when you sign in.
 
-Then create both token files on your Mac:
+Then create both token files on your Mac and store them as secrets:
 
 ```bash
-python archive.py --mode login
+python archive.py --mode login     # browser opens twice: read-only, then modify
+gh secret set GMAIL_TOKEN_READONLY < token_readonly.json
+gh secret set GMAIL_TOKEN_MODIFY < token_modify.json
 ```
 
-A browser opens twice: first to approve read-only access, then to approve modify access.
+If you published the app *after* creating the tokens, delete `token_*.json` and
+run `--mode login` again. Tokens issued in Testing mode still expire after 7 days.
 
-### 2. Create the AWS role for GitHub
+### 2. Give GitHub access to AWS
+
+Choose one option.
+
+#### Option A: access keys (simplest)
+
+Create an IAM user with the permissions in `aws/github-s3-policy.json` (edit the
+bucket name if yours differs). Then store its keys and the other settings:
+
+```bash
+gh secret set AWS_ACCESS_KEY_ID          # paste when prompted
+gh secret set AWS_SECRET_ACCESS_KEY      # paste when prompted
+gh secret set AWS_REGION --body us-east-1
+gh secret set S3_BUCKET --body gmailstore
+```
+
+Access keys don't expire, so treat them like a password. Rotate them
+periodically, or move to option B.
+
+#### Option B: OIDC role (recommended)
+
+GitHub signs in to an IAM role with short-lived credentials. No AWS keys are
+stored in GitHub.
 
 ```bash
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -408,41 +449,50 @@ aws iam create-role --role-name gmail-archive-github \
 aws iam put-role-policy --role-name gmail-archive-github \
   --policy-name gmail-archive-s3 \
   --policy-document file://aws/github-s3-policy.json
+
+gh secret set AWS_ROLE_ARN --body "arn:aws:iam::$ACCOUNT_ID:role/gmail-archive-github"
+gh secret set AWS_REGION --body us-east-1
+gh secret set S3_BUCKET --body gmailstore
 ```
 
 About these policies:
 
 - **Trust policy:** only allows runs from the `main` branch and from the
-  `mailbox-cleanup` environment of this repository.
-- **Permissions policy:** only allows listing the `gmailstore` bucket and reading
-  and writing its objects. Edit the bucket name if yours differs.
+  `mailbox-cleanup` environment of `shehuj/Gmail-to-Amazon_Archive`.
+- **Permissions policy:** only allows listing the bucket and reading and writing
+  its objects.
 - **Session length:** `--max-session-duration 21600` lets a run keep its AWS
   credentials for up to 6 hours.
 
-### 3. Configure the repository
+Once `AWS_ROLE_ARN` is set, the workflows use it automatically. You can then
+delete the access key secrets and deactivate the IAM user's keys.
+
+### 3. Protect the cleanup workflow (optional)
+
+The cleanup job runs in the `mailbox-cleanup` environment. GitHub creates it on
+the first run, or you can create it yourself:
 
 ```bash
-gh variable set S3_BUCKET --body gmailstore
-gh variable set AWS_REGION --body us-east-1
-gh secret set AWS_ROLE_ARN --body "arn:aws:iam::$ACCOUNT_ID:role/gmail-archive-github"
-gh secret set GMAIL_TOKEN_READONLY < token_readonly.json
-
-# The modify token is only available to the cleanup environment
 gh api -X PUT repos/shehuj/Gmail-to-Amazon_Archive/environments/mailbox-cleanup
-gh secret set GMAIL_TOKEN_MODIFY --env mailbox-cleanup < token_modify.json
 ```
 
-For extra protection, add yourself as a **required reviewer** on the
-`mailbox-cleanup` environment: **Settings → Environments → mailbox-cleanup**. Every
-cleanup run then waits for your approval before it can touch the mailbox.
+Then go to **Settings → Environments → mailbox-cleanup** and set it up:
 
-Required reviewers are available on public repositories and on paid plans for
-private ones.
+- **Required reviewer:** add yourself. Every cleanup run then waits for your
+  approval before it can touch the mailbox. This is available on public
+  repositories and on paid plans for private ones.
+- **Modify token:** move `GMAIL_TOKEN_MODIFY` from the repository secrets into this
+  environment, so only the cleanup job can read it:
+
+  ```bash
+  gh secret set GMAIL_TOKEN_MODIFY --env mailbox-cleanup < token_modify.json
+  gh secret delete GMAIL_TOKEN_MODIFY
+  ```
 
 ### 4. Seed the state database
 
 If you have already archived from your Mac, upload your local state so the
-workflows continue from it instead of starting over:
+workflows continue from it instead of listing and archiving from scratch:
 
 ```bash
 aws s3 cp archive_state.sqlite3 s3://gmailstore/state/archive_state.sqlite3
@@ -451,12 +501,16 @@ aws s3 cp archive_state.sqlite3 s3://gmailstore/state/archive_state.sqlite3
 From then on, the S3 copy is the source of truth. If you also run the script
 locally:
 
-1. Download the state database from S3 first.
+1. Download the state database from S3 first:
+   `aws s3 cp s3://gmailstore/state/archive_state.sqlite3 .`
 2. Run the script.
 3. Upload the state database back to S3.
 4. Never run locally while a workflow is running.
 
-### Running from the command line
+### 5. Run the workflows
+
+In the **Actions** tab, choose a workflow and click **Run workflow**. Or use the
+command line:
 
 ```bash
 gh workflow run ingest.yml -f limit=5000 -f workers=12
@@ -466,3 +520,15 @@ gh run watch
 ```
 
 Each run writes the archive state summary to the run's summary page.
+
+### Workflow troubleshooting
+
+| Error | Fix |
+| --- | --- |
+| `Check configuration`: `Missing ...` | Add each listed setting (see [Required settings](#required-settings)). |
+| `Input required and not supplied: aws-region` | The run used an older workflow version. Push the latest workflows to `main` and run again. |
+| `Could not assume role` / `Not authorized to perform sts:AssumeRoleWithWebIdentity` | The OIDC trust policy doesn't match the repository, branch or environment. Run from `main`, and check `aws/github-oidc-trust.json`. |
+| `Cannot access bucket` / `AccessDenied` | Check `S3_BUCKET` and `AWS_REGION`, and that the IAM user or role has the permissions in `aws/github-s3-policy.json`. |
+| `Gmail token ... could not be refreshed` | The token expired or was revoked. Publish the app to **In production**, run `--mode login`, and update the token secrets. |
+| `No state database at ...` (cleanup) | Run the ingest workflow first, or seed the state database (step 4). |
+| Run stopped with `--max-runtime reached` | Expected for long runs. Run the workflow again to continue. |
